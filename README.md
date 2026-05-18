@@ -115,11 +115,3 @@ const response = await client.chat.completions.create({
 });
 console.log(response.choices[0].message.content);
 ```
-
-## Tests
-
-```bash
-npm test
-```
-
-Uses `test/mock-kiro.js` (no real `kiro-cli` needed).
