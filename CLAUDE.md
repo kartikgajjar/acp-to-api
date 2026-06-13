@@ -90,8 +90,8 @@ On startup, if `HOST ≠ 127.0.0.1/localhost` and `ACP_API_KEY` is empty and `AL
 | `OPENAI_API_KEY` | _(required)_ | Passed to child process env; never logged |
 | `CODEX_CMD` | `codex-acp` | Binary path — pin to version verified by spike |
 | `CODEX_MODE` | `full-access` | Permission mode |
-| `CODEX_MODEL_DEFAULT` | `auto` | |
-| `CODEX_AVAILABLE_MODELS` | `auto,o4-mini,gpt-4o,o3,o3-mini` | CSV for `/v1/models` |
+| `CODEX_MODEL_DEFAULT` | `gpt-5.5` | |
+| `CODEX_AVAILABLE_MODELS` | `gpt-5.5,gpt-5.4,gpt-5.4-mini` | CSV for `/v1/models` |
 | `POOL_SIZE` | `4` | |
 | `SESSION_TTL_MS` | `1800000` | |
 | `MAX_EXEC_MS` | `600000` | Prompt timeout → cancel + 504 |

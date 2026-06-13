@@ -33,8 +33,8 @@ const CODEX_CMD        = process.env.CODEX_CMD                 ?? 'codex-acp';
 const CODEX_ARGS       = process.env.CODEX_ARGS                ?? '';
 const CODEX_CWD        = process.env.CODEX_CWD                 ?? process.cwd();
 const CODEX_MODE       = process.env.CODEX_MODE                ?? 'full-access';
-const CODEX_MODEL_DEFAULT = process.env.CODEX_MODEL_DEFAULT    ?? 'auto';
-const CODEX_AVAILABLE_MODELS = (process.env.CODEX_AVAILABLE_MODELS ?? 'auto,o4-mini,gpt-4o,o3,o3-mini')
+const CODEX_MODEL_DEFAULT = process.env.CODEX_MODEL_DEFAULT    ?? 'gpt-5.5';
+const CODEX_AVAILABLE_MODELS = (process.env.CODEX_AVAILABLE_MODELS ?? 'gpt-5.5,gpt-5.4,gpt-5.4-mini')
                                 .split(',').map(s => s.trim()).filter(Boolean);
 const DEBUG            = process.env.DEBUG                     === '1';
 const POOL_SIZE        = parseInt(process.env.POOL_SIZE        ?? '4');
