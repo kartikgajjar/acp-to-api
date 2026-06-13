@@ -1,18 +1,23 @@
 {
-  "name": "acp-openai-proxy",
-  "version": "3.0.0",
-  "type": "module",
-  "main": "kiro-api-bridge-server.js",
-  "scripts": {
-    "start": "node kiro-api-bridge-server.js",
-    "dev": "DEBUG=1 node kiro-api-bridge-server.js",
-    "full": "POOL_SIZE=1 node kiro-api-bridge-server-full.js",
-    "full_pool": "POOL_SIZE=4 node kiro-api-bridge-server-full.js",
-    "test": "node --test test/regression.test.js"
-  },
-  "dependencies": {
-    "cors": "^2.8.5",
-    "dotenv": "^17.4.2",
-    "express": "^5.2.0"
-  }
+	"name": "acp-openai-proxy",
+	"version": "3.0.0",
+	"type": "module",
+	"main": "kiro-api-bridge-server.js",
+	"scripts": {
+		"start": "node kiro-api-bridge-server.js",
+		"dev": "DEBUG=1 node kiro-api-bridge-server.js",
+		"full": "POOL_SIZE=1 node kiro-api-bridge-server-full.js",
+		"full_pool": "POOL_SIZE=4 node kiro-api-bridge-server-full.js",
+		"test": "node --test test/regression.test.js",
+		"format": "biome format --write .",
+		"check": "biome check --write ."
+	},
+	"dependencies": {
+		"cors": "^2.8.5",
+		"dotenv": "^17.4.2",
+		"express": "^5.2.0"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.5.0"
+	}
 }
