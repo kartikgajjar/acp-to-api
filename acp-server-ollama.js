@@ -244,14 +244,13 @@ if (PROFILE.requiresAuthWhenRemote && HOST !== '127.0.0.1' && HOST !== 'localhos
 }
 
 function _detectGPUProviders() {
+  // Windows: onnxruntime-node bundles the DirectML execution provider, which
+  // self-selects a DX12 GPU. Prefer it unconditionally — no hardware probe needed
+  // (the old `wmic` probe is unreliable: it's deprecated and absent from many
+  // shells / Windows 11 24H2+). getModel() falls back to CPU if DML can't init.
+  if (process.platform === 'win32') return ['dml', 'cpu'];
+  // Linux/Mac: use CUDA when an NVIDIA GPU is visible, else CPU.
   try {
-    if (process.platform === 'win32') {
-      const out = execFileSync('wmic', ['path', 'win32_videocontroller', 'get', 'name', '/value'],
-        { timeout: 3000, encoding: 'utf8' });
-      const names = (out.match(/Name=(.+)/gi) ?? []).map(l => l.slice(5).trim()).filter(Boolean);
-      const hasGPU = names.some(n => !/Microsoft Basic Display/i.test(n));
-      return hasGPU ? ['dml', 'cpu'] : ['cpu'];
-    }
     execFileSync('nvidia-smi', [], { stdio: 'ignore', timeout: 3000 });
     return ['cuda', 'cpu'];
   } catch {
@@ -634,7 +633,16 @@ class EmbeddingRegistry {
     dbg('embeddings', `loading model ${name}`);
     const opts = { model: enumVal, executionProviders: EMBEDDING_PROVIDERS };
     if (EMBEDDING_CACHE_DIR) opts.cacheDir = EMBEDDING_CACHE_DIR;
-    const model = await FlagEmbedding.init(opts);
+    let model;
+    try {
+      model = await FlagEmbedding.init(opts);
+    } catch (e) {
+      // GPU provider unavailable (no DX12 device, missing driver, …) — degrade to CPU
+      // rather than crashing startup. No-op when CPU was already the only provider.
+      if (EMBEDDING_PROVIDERS.length === 1 && EMBEDDING_PROVIDERS[0] === 'cpu') throw e;
+      log('embeddings', `provider [${EMBEDDING_PROVIDERS.join(',')}] init failed for ${name} (${e.message}) — falling back to cpu`);
+      model = await FlagEmbedding.init({ ...opts, executionProviders: ['cpu'] });
+    }
     this._cache.set(name, model);
     return model;
   }
