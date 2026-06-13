@@ -17,7 +17,8 @@
 		"@zed-industries/codex-acp": "*",
 		"cors": "^2.8.5",
 		"dotenv": "^17.4.2",
-		"express": "^5.2.0"
+		"express": "^5.2.0",
+		"fastembed": "^2.1.0"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "2.5.0"
