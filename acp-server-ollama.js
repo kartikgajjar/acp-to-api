@@ -74,7 +74,10 @@ const ALLOWED_IPS = (process.env.ALLOWED_IPS ?? '').split(',').map(t => t.trim()
 // callers (e.g. LangFlow) that don't send x-session-id themselves.
 const AUTO_SESSION_HASH = process.env.AUTO_SESSION_HASH === '1';
 
-const EMBEDDING_MODEL_DEFAULT  = process.env.EMBEDDING_MODEL_DEFAULT  ?? 'BGESmallENV15';
+const EMBEDDING_PROVIDERS     = (process.env.EMBEDDING_PROVIDERS ?? 'cpu')
+                                   .split(',').map(t => t.trim()).filter(Boolean);
+const _hasGPU                 = EMBEDDING_PROVIDERS.some(p => p !== 'cpu' && p !== 'wasm' && p !== 'xnnpack' && p !== 'webgl');
+const EMBEDDING_MODEL_DEFAULT = process.env.EMBEDDING_MODEL_DEFAULT ?? (_hasGPU ? 'BGEBaseENV15' : 'BGESmallENV15');
 const EMBEDDING_MODELS_ENABLED = (process.env.EMBEDDING_MODELS_ENABLED ?? EMBEDDING_MODEL_DEFAULT)
                                    .split(',').map(t => t.trim()).filter(Boolean);
 const EMBEDDING_CACHE_DIR      = process.env.EMBEDDING_CACHE_DIR      ?? undefined;
@@ -453,7 +456,7 @@ class EmbeddingRegistry {
   async init() {
     const t0 = Date.now();
     await this.getModel(EMBEDDING_MODEL_DEFAULT);
-    log('embeddings', `default model ${EMBEDDING_MODEL_DEFAULT} loaded in ${Date.now() - t0}ms`);
+    log('embeddings', `default model ${EMBEDDING_MODEL_DEFAULT} loaded in ${Date.now() - t0}ms (providers: ${EMBEDDING_PROVIDERS.join(',')})`);
   }
 
   async getModel(name) {
@@ -462,7 +465,7 @@ class EmbeddingRegistry {
     const enumVal = EMBEDDING_MODEL_MAP[name];
     if (!enumVal) throw new ModelNotEnabledError(name);
     dbg('embeddings', `loading model ${name}`);
-    const opts = { model: enumVal };
+    const opts = { model: enumVal, executionProviders: EMBEDDING_PROVIDERS };
     if (EMBEDDING_CACHE_DIR) opts.cacheDir = EMBEDDING_CACHE_DIR;
     const model = await FlagEmbedding.init(opts);
     this._cache.set(name, model);
@@ -1168,7 +1171,7 @@ const server = app.listen(PORT, () => {
 │  IP ACL:  ${ALLOWED_IPS.length ? ALLOWED_IPS.join(', ') : 'open'}
 │  Mode:    ${DEBUG ? 'DEBUG' : 'production'}  |  Pool: ${POOL_SIZE} workers  |  Ping: ${PING_INTERVAL_MS / 1000}s
 │  Models:  ${_startupModels.join(', ')}
-│  Embed:   ${EMBEDDING_MODEL_DEFAULT} (${EMBEDDING_MODELS_ENABLED.length} model${EMBEDDING_MODELS_ENABLED.length > 1 ? 's' : ''} enabled)
+│  Embed:   ${EMBEDDING_MODEL_DEFAULT} (${EMBEDDING_MODELS_ENABLED.length} model${EMBEDDING_MODELS_ENABLED.length > 1 ? 's' : ''} enabled, providers: ${EMBEDDING_PROVIDERS.join(',')})
 │  TTL:     session=${SESSION_TTL_MS / 60000}min  exec_max=${MAX_EXEC_MS / 60000}min
 │  Session: ${AUTO_SESSION_HASH ? 'auto (system-prompt hash)' : 'stateless pool (set AUTO_SESSION_HASH=1 to persist)'}
 └──────────────────────────────────────────────────────────────┘`);

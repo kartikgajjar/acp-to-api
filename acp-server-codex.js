@@ -15,6 +15,8 @@
  */
 
 import 'dotenv/config';
+// Allow --debug CLI flag as alias for DEBUG=1
+if (process.argv.includes('--debug')) process.env.DEBUG = '1';
 import express from 'express';
 import cors from 'cors';
 import { spawn } from 'child_process';
@@ -399,7 +401,7 @@ class ACPSession extends EventEmitter {
     try {
       await this._req('session/set_config_option', {
         sessionId: this.sessionId,
-        config_id: 'model',
+        configId: 'model',
         value: modelId,
       });
       this.currentModel = modelId;
