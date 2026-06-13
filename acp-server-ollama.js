@@ -46,7 +46,7 @@ console.error('╚════════════════════�
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import { spawn } from 'child_process';
+import { spawn, execFileSync } from 'child_process';
 import readline from 'readline';
 import { EventEmitter } from 'events';
 import { randomUUID, createHash } from 'crypto';
@@ -74,8 +74,25 @@ const ALLOWED_IPS = (process.env.ALLOWED_IPS ?? '').split(',').map(t => t.trim()
 // callers (e.g. LangFlow) that don't send x-session-id themselves.
 const AUTO_SESSION_HASH = process.env.AUTO_SESSION_HASH === '1';
 
-const EMBEDDING_PROVIDERS     = (process.env.EMBEDDING_PROVIDERS ?? 'cpu')
-                                   .split(',').map(t => t.trim()).filter(Boolean);
+function _detectGPUProviders() {
+  try {
+    if (process.platform === 'win32') {
+      const out = execFileSync('wmic', ['path', 'win32_videocontroller', 'get', 'name', '/value'],
+        { timeout: 3000, encoding: 'utf8' });
+      const names = (out.match(/Name=(.+)/gi) ?? []).map(l => l.slice(5).trim()).filter(Boolean);
+      const hasGPU = names.some(n => !/Microsoft Basic Display/i.test(n));
+      return hasGPU ? ['dml', 'cpu'] : ['cpu'];
+    }
+    execFileSync('nvidia-smi', [], { stdio: 'ignore', timeout: 3000 });
+    return ['cuda', 'cpu'];
+  } catch {
+    return ['cpu'];
+  }
+}
+
+const EMBEDDING_PROVIDERS     = process.env.EMBEDDING_PROVIDERS
+                                   ? process.env.EMBEDDING_PROVIDERS.split(',').map(t => t.trim()).filter(Boolean)
+                                   : _detectGPUProviders();
 const _hasGPU                 = EMBEDDING_PROVIDERS.some(p => p !== 'cpu' && p !== 'wasm' && p !== 'xnnpack' && p !== 'webgl');
 const EMBEDDING_MODEL_DEFAULT = process.env.EMBEDDING_MODEL_DEFAULT ?? (_hasGPU ? 'BGEBaseENV15' : 'BGESmallENV15');
 const EMBEDDING_MODELS_ENABLED = (process.env.EMBEDDING_MODELS_ENABLED ?? EMBEDDING_MODEL_DEFAULT)

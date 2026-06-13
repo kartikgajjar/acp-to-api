@@ -66,13 +66,13 @@ npm run check    # biome check --write . (format + lint)
 
 Local embeddings via `fastembed` (`EmbeddingRegistry`). Optional peer dep — `npm install fastembed`.
 
-Default model auto-selects based on `EMBEDDING_PROVIDERS`: `BGESmallENV15` on CPU, `BGEBaseENV15` when a GPU provider (`dml`, `cuda`, etc.) is configured. Override with `EMBEDDING_MODEL_DEFAULT`.
+GPU is auto-detected at startup via `wmic` (Windows → `dml,cpu`) or `nvidia-smi` (Linux → `cuda,cpu`); falls back to `cpu` if neither is found. Override with `EMBEDDING_PROVIDERS`. Default model auto-selects based on detected providers: `BGEBaseENV15` when GPU is active, `BGESmallENV15` on CPU. Override with `EMBEDDING_MODEL_DEFAULT`.
 
 | Var | Default | Notes |
 |---|---|---|
 | `EMBEDDING_MODEL_DEFAULT` | _(auto)_ | `BGESmallENV15` (CPU) or `BGEBaseENV15` (GPU). Explicit value overrides auto-select. |
 | `EMBEDDING_MODELS_ENABLED` | same as default | CSV; only listed models are loadable at runtime |
-| `EMBEDDING_PROVIDERS` | `cpu` | CSV of ONNX execution providers: `dml,cpu` (Windows DirectML), `cuda,cpu` (Linux NVIDIA), `cpu` (default) |
+| `EMBEDDING_PROVIDERS` | _(auto-detected)_ | CSV of ONNX execution providers. Overrides auto-detection. `dml,cpu` (Windows DirectML), `cuda,cpu` (Linux NVIDIA), `cpu` (default) |
 | `EMBEDDING_CACHE_DIR` | _(none)_ | Directory for downloaded ONNX model files |
 | `EMBEDDING_BATCH_SIZE` | `32` | Inference batch size |
 | `EMBEDDING_MAX_INPUTS` | `2048` | Max array length for `/api/embed` |
