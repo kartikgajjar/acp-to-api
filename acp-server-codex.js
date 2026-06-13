@@ -1076,16 +1076,25 @@ app.use((err, req, res, _next) => {
 
 let _startupModels = CODEX_AVAILABLE_MODELS;
 
-// Try to discover models from a warm pool slot
+// Try to discover models dynamically from the running binary
 try {
   const slot = await pool.acquire();
   try {
     const result = await slot.client._req('session/new', { cwd: CODEX_CWD, mcpServers: [] });
     await slot.client._setMode(CODEX_MODE).catch(() => {});
+    dbg('startup', `session/new response: ${JSON.stringify(result)}`);
     const ids = (result?.models?.availableModels ?? []).map(m => m.modelId);
-    if (ids.length) _startupModels = ['auto', ...ids.filter(id => id !== 'auto')];
+    if (ids.length) {
+      _startupModels = [...new Set([...ids])];
+      log('startup', `discovered ${_startupModels.length} models from binary: ${_startupModels.join(', ')}`);
+    } else {
+      log('startup', `session/new returned no model list — using CODEX_AVAILABLE_MODELS env var (${_startupModels.join(', ')})`);
+      log('startup', `  (set DEBUG=1 to see the raw session/new response and verify the field path)`);
+    }
   } finally { pool.release(slot); }
-} catch { /* non-fatal — use CODEX_AVAILABLE_MODELS default */ }
+} catch (e) {
+  log('startup', `model discovery failed (${e.message}) — using CODEX_AVAILABLE_MODELS env var (${_startupModels.join(', ')})`);
+}
 
 const server = app.listen(PORT, HOST, () => {
   if (_logStream) {
