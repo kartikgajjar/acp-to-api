@@ -1144,10 +1144,19 @@ try {
   const slot = await pool.acquire();
   try {
     const result = await slot.client._req('session/new', { cwd: KIRO_CWD, mcpServers: [] });
+    dbg('startup', `session/new response: ${JSON.stringify(result)}`);
     const ids = (result?.models?.availableModels ?? []).map((m) => m.modelId);
-    if (ids.length) _startupModels = ['auto', ...ids.filter((id) => id !== 'auto')];
+    if (ids.length) {
+      _startupModels = ['auto', ...ids.filter((id) => id !== 'auto')];
+      log('startup', `discovered ${_startupModels.length} models from binary: ${_startupModels.join(', ')}`);
+    } else {
+      log('startup', `session/new returned no model list — defaulting to ['auto']`);
+      log('startup', `  (set DEBUG=1 to see the raw session/new response and verify the field path)`);
+    }
   } finally { pool.release(slot); }
-} catch { /* non-fatal */ }
+} catch (e) {
+  log('startup', `model discovery failed (${e.message}) — defaulting to ['auto']`);
+}
 
 const server = app.listen(PORT, () => {
   const tokenDisplay = AUTH_TOKENS.length
