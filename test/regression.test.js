@@ -17,7 +17,7 @@ import { fileURLToPath } from 'url';
 import path from 'path';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SERVER    = path.join(__dirname, '..', 'acp-server-codex.js');
+const SERVER    = path.join(__dirname, '..', 'acp-server-openai.js');
 const MOCK      = path.join(__dirname, 'mock-codex-acp.mjs');
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

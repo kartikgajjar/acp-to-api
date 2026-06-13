@@ -4,32 +4,47 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Two standalone ACP-to-HTTP shims:
+Two standalone ACP-to-HTTP shims. **The file name = the REST interface it exposes; the ACP backend is decoupled and selected at startup** via `--backend=<name>`. Either interface can drive either backend.
 
-| File | API surface | Backend | Port |
+**Interfaces** (the file = the REST surface):
+
+| File | REST surface | Default port | Default backend |
 |---|---|---|---|
-| `acp-server-ollama.js` | Ollama REST (`/api/chat`, `/api/tags`, embeddings, …) | `kiro-cli acp` (Kiro ACP) | 11434 |
-| `acp-server-codex.js` | OpenAI REST (`/v1/chat/completions`, `/v1/models`) | `codex-acp` (Codex ACP) | 3456 |
+| `acp-server-ollama.js` | Ollama REST (`/api/chat`, `/api/tags`, embeddings, …) | 11434 | `kiro` |
+| `acp-server-openai.js` | OpenAI REST (`/v1/chat/completions`, `/v1/models`) | 3456 | `codex` |
 
-Both spawn their respective ACP backends as child processes, speak JSON-RPC 2.0 over stdio, and translate between that protocol and the target REST shape.
+**Backends** (`--backend=kiro|codex`): defined as a single `BACKENDS` map that is kept **byte-identical** in both files (a regression test enforces this — edit both copies together; markers `// >>> BACKENDS` … `// <<< BACKENDS`). The map is the source of truth for every per-backend quirk (spawn cmd/args, `notifications/initialized`, `session/set_mode`, model-switch method, notification parsing, debug filtering). A single `ACPSession` consumes the selected `PROFILE` with no backend `if`-branches.
+
+`acp-server-codex.js` is a **deprecated forwarding shim** for `acp-server-openai.js` (removed next release).
+
+Both spawn the selected ACP backend as child processes, speak JSON-RPC 2.0 over stdio, and translate between that protocol and the target REST shape.
 
 ## Commands
 
 ```bash
 npm install
 
-# Ollama-compatible server (Kiro backend)
+# Ollama interface (default backend: kiro)
 npm start                          # node acp-server-ollama.js
 npm run start:dev                  # DEBUG=1 node acp-server-ollama.js
+node acp-server-ollama.js --backend=codex   # Ollama surface over Codex (needs OPENAI_API_KEY)
 
-# OpenAI-compatible server (Codex backend)
-OPENAI_API_KEY=sk-... npm run codex        # node acp-server-codex.js
-OPENAI_API_KEY=sk-... npm run codex:dev    # DEBUG=1 node acp-server-codex.js
+# OpenAI interface (default backend: codex)
+OPENAI_API_KEY=sk-... npm run openai        # node acp-server-openai.js
+OPENAI_API_KEY=sk-... npm run openai:dev    # DEBUG=1 node acp-server-openai.js
+node acp-server-openai.js --backend=kiro    # OpenAI surface over Kiro (no OPENAI_API_KEY)
+# `npm run codex` / `codex:dev` remain as deprecated aliases.
 
-npm test         # node --test test/regression.test.js (runs against mock subprocess)
+npm test         # node --test test/*.test.js (regression + cross-backend, mock subprocess)
 npm run format   # biome format --write .
 npm run check    # biome check --write . (format + lint)
 ```
+
+### Backend selection & decoupled requirements
+
+- `--backend=<name>` (case-insensitive, trimmed). Unknown/missing-map → exit 1. Empty `--backend=` → interface default.
+- `OPENAI_API_KEY` is a **backend** requirement: asserted in the codex profile's `buildEnv` whenever `--backend=codex` (either interface); not needed for `kiro`.
+- The remote-binding safety gate **follows the backend**: it fires only when `PROFILE.requiresAuthWhenRemote` (codex) and `HOST` is non-localhost and the interface's token list (`ACP_API_KEY` for openai, `AUTH_TOKEN` for ollama) is empty and `ALLOW_INSECURE_REMOTE≠1`.
 
 ## acp-server-ollama.js — Kiro / Ollama surface
 
@@ -54,17 +69,13 @@ npm run check    # biome check --write . (format + lint)
 
 `POST /api/chat`, `POST /api/generate`, `GET /api/tags`, `POST /api/show`, `GET /api/ps`, `POST /api/embed`, `POST /api/embeddings`, `GET /api/version`, `GET /health`, `GET /health/agents`, `DELETE /v1/sessions/:id`
 
-### Protocol quirks (kiro-cli)
+### Protocol quirks
 
-- `notifications/initialized` is **deliberately omitted** — kiro-cli rejects it.
-- `session/request_permission` is auto-granted with `{ optionId: 'allow_always', granted: true }`.
-- `ping` returns `-32601` from kiro-cli; the keepalive timer treats this as "alive".
-- `session/update` notifications arrive under several method names with varying field names; `_route` handles all observed shapes.
-- Tool call arguments from kiro: plain objects (not JSON strings) — Ollama format.
+Per-backend quirks live in the `BACKENDS` profile map (source of truth), not scattered through `ACPSession`. For `kiro`: `notifications/initialized` omitted (kiro rejects it); model switch via `session/set_model`; `session/update` arrives under `session/update` / `session/notification` / `_kiro.dev/session/update`. Shared across both backends: `session/request_permission` auto-granted `{ optionId: 'allow_always', granted: true }`; `ping` `-32601` treated as alive. Tool-call argument **output** format is interface-determined (Ollama = plain object, OpenAI = JSON string), independent of backend.
 
 ### Embeddings
 
-Local embeddings via `fastembed` (`EmbeddingRegistry`). Optional peer dep — `npm install fastembed`.
+Local embeddings via `fastembed` (`EmbeddingRegistry`). Optional peer dep — `npm install fastembed`. It is loaded **lazily**: the server boots (and chat/generate work over any backend) even when fastembed is absent; the `/api/embed*` endpoints then return 503. `embeddings.installed` in `/health` reflects availability.
 
 GPU is auto-detected at startup via `wmic` (Windows → `dml,cpu`) or `nvidia-smi` (Linux → `cuda,cpu`); falls back to `cpu` if neither is found. Override with `EMBEDDING_PROVIDERS`. Default model auto-selects based on detected providers: `BGEBaseENV15` when GPU is active, `BGESmallENV15` on CPU. Override with `EMBEDDING_MODEL_DEFAULT`.
 
@@ -79,11 +90,11 @@ GPU is auto-detected at startup via `wmic` (Windows → `dml,cpu`) or `nvidia-sm
 
 ---
 
-## acp-server-codex.js — Codex / OpenAI surface
+## acp-server-openai.js — OpenAI surface (codex backend by default)
 
 ### Runtime
 
-Requires `OPENAI_API_KEY`. The `@zed-industries/codex-acp` npm package provides the `codex-acp` binary (ACP adapter for OpenAI Codex, stdio-based). Server defaults to **http://127.0.0.1:3456**.
+With the default codex backend, requires `OPENAI_API_KEY`. The `@zed-industries/codex-acp` npm package provides the `codex-acp` binary (ACP adapter for OpenAI Codex, stdio-based). Server defaults to **http://127.0.0.1:3456**. (Renamed from `acp-server-codex.js`, which remains as a deprecated shim.)
 
 **Pre-implementation spike** (run before deploying against real codex-acp): manually probe JSON-RPC methods to verify `initialize`, `session/new`, `session/set_mode`, `session/set_config_option`, streaming notifications, and `UsageUpdate` against the installed version.
 
@@ -98,7 +109,7 @@ On startup, if `HOST ≠ 127.0.0.1/localhost` and `ACP_API_KEY` is empty and `AL
 | `PORT` | `3456` | |
 | `HOST` | `127.0.0.1` | Use `0.0.0.0` only with `ACP_API_KEY` set or `ALLOW_INSECURE_REMOTE=1` |
 | `ALLOW_INSECURE_REMOTE` | `0` | `1` = allow HOST=0.0.0.0 with no auth (explicit opt-in) |
-| `OPENAI_API_KEY` | _(required)_ | Passed to child process env; never logged |
+| `OPENAI_API_KEY` | _(required for codex backend)_ | Passed to child process env; never logged. Not needed for `--backend=kiro` |
 | `CODEX_CMD` | `codex-acp` | Binary path — pin to version verified by spike |
 | `CODEX_MODE` | `full-access` | Permission mode |
 | `CODEX_MODEL_DEFAULT` | `gpt-5.5` | |
@@ -142,10 +153,10 @@ Not supported: `response_format.type = 'json_schema'` (no enforcement), `n > 1`,
 ### Testing
 
 ```bash
-npm test   # node:test suite using test/mock-codex-acp.mjs as CODEX_CMD
+npm test   # node --test test/*.test.js
 
 # Manual smoke test (requires real OPENAI_API_KEY + codex-acp installed)
-OPENAI_API_KEY=sk-... node acp-server-codex.js &
+OPENAI_API_KEY=sk-... node acp-server-openai.js &
 curl http://localhost:3456/health
 curl http://localhost:3456/v1/models
 curl http://localhost:3456/v1/chat/completions \
@@ -153,11 +164,14 @@ curl http://localhost:3456/v1/chat/completions \
   -d '{"model":"auto","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
+- `test/regression.test.js` — OpenAI-interface + codex-backend regression suite, using `test/mock-codex-acp.mjs` as `CODEX_ARGS`.
+- `test/cross-backend.test.js` — the 2×2 interface×backend matrix against the recording mock `test/mock-acp.mjs`: asserts each backend's protocol (initialized / set_mode / set_model vs set_config_option), that tool-arg format tracks the interface, the backend-following safety gate, auth enforcement, `--backend` parsing, the deprecated shim boot, and the `BACKENDS` byte-identity guard.
+
 ---
 
 ## Shared conventions
 
-- Auth: `ACP_API_KEY` / `AUTH_TOKEN` (comma-separated bearer tokens). `/health` and `/` are always unauthenticated.
-- Errors: OpenAI-envelope `{ error: { message, type, param, code } }` in codex server; `{ error: <string> }` Ollama format in ollama server.
+- Auth: `ACP_API_KEY` (openai interface) / `AUTH_TOKEN` (ollama interface), comma-separated bearer tokens. `/health` and `/` are always unauthenticated.
+- Errors: OpenAI-envelope `{ error: { message, type, param, code } }` in the openai server; `{ error: <string> }` Ollama format in the ollama server.
 - No build step — plain ESM (`"type": "module"`), Node 18+.
 - Biome (`biome.json`) — tabs, single quotes. Run `npm run check` before committing.

@@ -1,16 +1,12 @@
 /**
- * ╔══════════════════════════════════════════════════════════════════╗
- * ║  ⚠️  DEPRECATED — DO NOT USE  ⚠️                                   ║
- * ║  Replaced by acp-server-ollama.js (unified Windows+POSIX build    ║
- * ║  with session persistence, delta sends, and tool-call fixes).    ║
- * ║  This file is kept for reference only and is NOT maintained.     ║
- * ╚══════════════════════════════════════════════════════════════════╝
- *
- * Ollama-Compatible HTTP Server over Kiro ACP
+ * Ollama-Compatible HTTP Server over ACP
  * ─────────────────────────────────────────────
  * Drop-in replacement for the Ollama daemon. Any tool that talks to Ollama
  * (LangChain, Continue.dev, Open WebUI, llama-index, …) can point at this
- * server and transparently route to Kiro ACP agents.
+ * server and transparently route to an ACP agent backend.
+ *
+ * The ACP backend is selected with --backend=<name> (default: kiro). Both
+ * `kiro` (kiro-cli) and `codex` (codex-acp) backends are supported.
  *
  * Implements the full Ollama REST API:
  *   POST /api/chat           multi-turn chat (streaming NDJSON or JSON)
@@ -38,12 +34,9 @@
  *     -d '{"model":"auto","messages":[{"role":"user","content":"Hello"}]}'
  */
 
-console.error('╔════════════════════════════════════════════════════════════╗');
-console.error('║  DEPRECATED: acp-ollama-server.js is no longer maintained.  ║');
-console.error('║  Use acp-server-ollama.js instead.                          ║');
-console.error('╚════════════════════════════════════════════════════════════╝');
-
 import 'dotenv/config';
+// Allow --debug CLI flag as alias for DEBUG=1
+if (process.argv.includes('--debug')) process.env.DEBUG = '1';
 import express from 'express';
 import cors from 'cors';
 import { spawn, execFileSync } from 'child_process';
@@ -51,14 +44,31 @@ import readline from 'readline';
 import { EventEmitter } from 'events';
 import { randomUUID, createHash } from 'crypto';
 import path from 'path';
-import { EmbeddingModel, FlagEmbedding } from 'fastembed';
+
+// fastembed is an OPTIONAL peer dependency — loaded lazily so the server can run
+// (chat/generate over any backend) even when it isn't installed. The embeddings
+// endpoints return 503 when it's absent.
+let _fastembed   = null;
+let _fastembedErr = null;
+async function loadFastembed() {
+  if (_fastembed) return _fastembed;
+  if (_fastembedErr) throw _fastembedErr;
+  try {
+    _fastembed = await import('fastembed');
+    return _fastembed;
+  } catch {
+    const msg = 'embeddings unavailable: fastembed is not installed (run `npm install fastembed`)';
+    _fastembedErr = Object.assign(new Error(msg), { status: 503, msg });
+    throw _fastembedErr;
+  }
+}
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const PORT             = parseInt(process.env.PORT             ?? '11434');
-const KIRO_CMD         = process.env.KIRO_CMD                  ?? 'kiro-cli';
-const KIRO_ARGS        = process.env.KIRO_ARGS                 ?? 'acp';
-const KIRO_CWD         = process.env.KIRO_CWD                  ?? process.cwd();
+const HOST             = process.env.HOST                      ?? '0.0.0.0';
+const ALLOW_INSECURE   = process.env.ALLOW_INSECURE_REMOTE     === '1';
+const CWD              = process.env.ACP_CWD ?? process.env.KIRO_CWD ?? process.env.CODEX_CWD ?? process.cwd();
 const DEBUG            = process.env.DEBUG                     === '1';
 
 const POOL_SIZE        = parseInt(process.env.POOL_SIZE        ?? '4');
@@ -73,6 +83,165 @@ const ALLOWED_IPS = (process.env.ALLOWED_IPS ?? '').split(',').map(t => t.trim()
 // derived from the system-prompt hash. This preserves conversation context across turns for
 // callers (e.g. LangFlow) that don't send x-session-id themselves.
 const AUTO_SESSION_HASH = process.env.AUTO_SESSION_HASH === '1';
+
+// ─── Backend profiles ─────────────────────────────────────────────────────────
+// This file exposes the Ollama REST surface; the ACP backend is selected with the
+// --backend=<name> flag (default: kiro). The BACKENDS map below is kept
+// BYTE-IDENTICAL with the copy in acp-server-openai.js — test/regression asserts
+// they match. When you edit one copy, edit the other identically.
+
+// >>> BACKENDS
+const BACKENDS = {
+  kiro: (env) => ({
+    name:  'kiro',
+    label: 'kiro-cli',
+    cmd:   env.KIRO_CMD ?? 'kiro-cli',
+    args:  (env.KIRO_ARGS ?? 'acp').split(' ').filter(Boolean),
+    clientName: 'acp-proxy',
+    requiresAuthWhenRemote: false,
+    sendInitialized: false,
+    mode: null,
+    defaultModel: 'auto',
+    fallbackModels: ['auto'],
+    buildEnv(parent) { return { ...parent }; },
+    formatStartupModels(ids) { return ['auto', ...ids.filter(id => id !== 'auto')]; },
+    async postNewSession() {},
+    async setModel(session, modelId) {
+      if (!modelId || modelId === 'auto' || modelId === session.currentModel) return;
+      await session._reqSafe('model', 'session/set_model', { sessionId: session.sessionId, modelId });
+      session.currentModel = modelId;
+    },
+    updateMethods: new Set(['session/update', 'session/notification', '_kiro.dev/session/update']),
+    parseUpdate(params) {
+      const u = params.update ?? params ?? {};
+      const type = u.sessionUpdate ?? u.type ?? '';
+      switch (type) {
+        case 'agent_message_chunk':
+        case 'AgentMessageChunk': {
+          const text = u.content?.text ?? u.content ?? u.text ?? '';
+          return text ? { kind: 'text', text } : null;
+        }
+        case 'agent_thought_chunk':
+        case 'AgentThoughtChunk': {
+          const text = u.content?.text ?? u.content ?? u.text ?? '';
+          return text ? { kind: 'thought', text } : null;
+        }
+        case 'tool_call':
+        case 'tool_call_chunk':
+          return { kind: 'thought', text: `[tool: ${u.title ?? u.name ?? 'unknown'}]\n` };
+        case 'tool_call_update': {
+          const out = u.output ?? u.content?.text;
+          return out ? { kind: 'thought', text: out } : null;
+        }
+        case 'plan': {
+          const entries = (u.entries ?? []).map(e => e.content ?? e).join('\n');
+          return entries ? { kind: 'plan', text: entries } : null;
+        }
+        default: return { kind: 'unhandled', type };
+      }
+    },
+    dbgSkip(msg) {
+      const m = msg.method;
+      if (m === 'session/update' || m === 'session/notification' || m === '_kiro.dev/session/update') return 'skip';
+      if (m === '_kiro.dev/commands/available') return 'commands';
+      if (m === '_kiro.dev/subagent/list_update') return 'skip';
+      if (!m && msg.error?.data === 'ping') return 'skip';
+      return null;
+    },
+  }),
+  codex: (env) => ({
+    name:  'codex',
+    label: 'codex-acp',
+    cmd:   env.CODEX_CMD ?? 'codex-acp',
+    args:  (env.CODEX_ARGS ?? '').split(' ').filter(Boolean),
+    clientName: 'acp-proxy',
+    requiresAuthWhenRemote: true,
+    sendInitialized: true,
+    mode: env.CODEX_MODE ?? 'full-access',
+    defaultModel: env.CODEX_MODEL_DEFAULT ?? 'gpt-5.5',
+    fallbackModels: (env.CODEX_AVAILABLE_MODELS ?? 'gpt-5.5,gpt-5.4,gpt-5.4-mini').split(',').map(s => s.trim()).filter(Boolean),
+    buildEnv(parent) {
+      if (!parent.OPENAI_API_KEY) throw new Error('codex backend requires OPENAI_API_KEY');
+      return { ...parent };
+    },
+    formatStartupModels(ids) { return [...new Set(ids)]; },
+    async postNewSession(session) {
+      if (!session.sessionId || !this.mode) return;
+      await session._reqSafe('mode', 'session/set_mode', { sessionId: session.sessionId, modeId: this.mode });
+    },
+    async setModel(session, modelId) {
+      if (!modelId || modelId === 'auto' || modelId === session.currentModel) return;
+      await session._reqSafe('model', 'session/set_config_option', { sessionId: session.sessionId, configId: 'model', value: modelId });
+      session.currentModel = modelId;
+    },
+    updateMethods: new Set(['session/update', 'session/notification']),
+    parseUpdate(params) {
+      const u = params.update ?? params ?? {};
+      let type = u.sessionUpdate ?? u.type ?? '';
+      let payload = u;
+      if (!type) {
+        const keys = Object.keys(u).filter(k => k !== 'sessionId');
+        if (keys.length >= 1) { type = keys[0]; payload = u[type] ?? u; }
+      }
+      switch (type) {
+        case 'agent_message_chunk':
+        case 'AgentMessageChunk': {
+          const text = payload.content?.text ?? payload.content ?? payload.text ?? u.content?.text ?? u.content ?? u.text ?? '';
+          return text ? { kind: 'text', text } : null;
+        }
+        case 'agent_thought_chunk':
+        case 'AgentThoughtChunk': {
+          const text = payload.content?.text ?? payload.content ?? payload.text ?? u.content?.text ?? u.content ?? u.text ?? '';
+          return text ? { kind: 'thought', text } : null;
+        }
+        case 'tool_call':
+        case 'tool_call_chunk':
+        case 'ToolCall':
+          return { kind: 'thought', text: `[tool: ${payload.title ?? payload.name ?? u.title ?? u.name ?? 'unknown'}]\n` };
+        case 'tool_call_update':
+        case 'ToolCallUpdate': {
+          const out = payload.output ?? payload.content?.text ?? u.output ?? u.content?.text;
+          return out ? { kind: 'thought', text: out } : null;
+        }
+        case 'plan':
+        case 'Plan': {
+          const entries = (payload.entries ?? u.entries ?? []).map(e => e.content ?? e).join('\n');
+          return entries ? { kind: 'plan', text: entries } : null;
+        }
+        case 'UsageUpdate':
+        case 'usage_update': {
+          const pt = payload.promptTokens ?? payload.prompt_tokens ?? u.promptTokens ?? u.prompt_tokens;
+          const ct = payload.completionTokens ?? payload.completion_tokens ?? u.completionTokens ?? u.completion_tokens;
+          return pt != null ? { kind: 'usage', promptTokens: pt, completionTokens: ct ?? 0 } : null;
+        }
+        default: return { kind: 'unhandled', type };
+      }
+    },
+    dbgSkip(msg) {
+      const m = msg.method;
+      if (m === 'session/update' || m === 'session/notification') return 'skip';
+      if (!m && (msg.error?.data === 'ping' || msg.error?.code === -32601)) return 'skip';
+      return null;
+    },
+  }),
+};
+// <<< BACKENDS
+
+const DEFAULT_BACKEND = 'kiro';
+const _backendArg  = process.argv.find(a => a.startsWith('--backend='))?.split('=')[1];
+const BACKEND_NAME = ((_backendArg ?? '').trim().toLowerCase()) || DEFAULT_BACKEND;
+if (!BACKENDS[BACKEND_NAME]) {
+  console.error(`[startup] ERROR: unknown --backend="${BACKEND_NAME}" (expected: ${Object.keys(BACKENDS).join('|')})`);
+  process.exit(1);
+}
+const PROFILE = BACKENDS[BACKEND_NAME](process.env);
+
+// Remote binding safety gate — a full-access backend must have auth when not on localhost
+if (PROFILE.requiresAuthWhenRemote && HOST !== '127.0.0.1' && HOST !== 'localhost' && AUTH_TOKENS.length === 0 && !ALLOW_INSECURE) {
+  console.error(`[startup] ERROR: HOST=${HOST} with no AUTH_TOKEN is unsafe for the ${PROFILE.name} backend (full-access agent).`);
+  console.error(`[startup] Set AUTH_TOKEN or set ALLOW_INSECURE_REMOTE=1 to override.`);
+  process.exit(1);
+}
 
 function _detectGPUProviders() {
   try {
@@ -172,17 +341,17 @@ class ACPSession extends EventEmitter {
   }
 
   async start() {
-    this._proc = spawn(KIRO_CMD, KIRO_ARGS.split(' '), {
-      cwd: KIRO_CWD,
+    this._proc = spawn(PROFILE.cmd, PROFILE.args, {
+      cwd: CWD,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: process.env,
+      env: PROFILE.buildEnv(process.env),
     });
-    this._proc.stderr.on('data', (d) => dbg(`kiro:${this.label}`, String(d).trim()));
+    this._proc.stderr.on('data', (d) => dbg(`${PROFILE.name}:${this.label}`, String(d).trim()));
     this._proc.once('exit', (code) => {
       this._dead = true;
       this._stopPing();
       log(`proc:${this.label}`, `exited (${code}), failing ${this._pending.size} pending`);
-      for (const [, { reject }] of this._pending) reject(new Error(`kiro-cli exited (${code})`));
+      for (const [, { reject }] of this._pending) reject(new Error(`${PROFILE.label} exited (${code})`));
       this._pending.clear();
       this.emit('dead');
     });
@@ -238,15 +407,13 @@ class ACPSession extends EventEmitter {
 
   _dbgLine(msg) {
     if (!DEBUG) return;
-    const m = msg.method;
-    if (m === 'session/update' || m === 'session/notification' || m === '_kiro.dev/session/update') return;
-    if (m === '_kiro.dev/commands/available') {
+    const skip = PROFILE.dbgSkip(msg);
+    if (skip === 'skip') return;
+    if (skip === 'commands') {
       const p = msg.params ?? {};
       dbg(`←${this.label}`, `commands/available  commands=${p.commands?.length ?? 0}  tools=${p.tools?.length ?? 0}  mcp=${p.mcpServers?.length ?? 0}`);
       return;
     }
-    if (m === '_kiro.dev/subagent/list_update') return;
-    if (!m && msg.error?.data === 'ping') return;
     const raw = JSON.stringify(msg);
     dbg(`←${this.label}`, raw.length > 300 ? raw.slice(0, 300) + '…' : raw);
   }
@@ -263,68 +430,47 @@ class ACPSession extends EventEmitter {
       this._send({ jsonrpc: '2.0', id: msg.id, result: { optionId: 'allow_always', granted: true } });
       return;
     }
-    if (msg.method === 'session/update' || msg.method === 'session/notification' ||
-        msg.method === '_kiro.dev/session/update') {
-      const u    = msg.params?.update ?? msg.params ?? {};
-      const type = u.sessionUpdate ?? u.type ?? '';
-      switch (type) {
-        case 'agent_message_chunk':
-        case 'AgentMessageChunk': {
-          const text = u.content?.text ?? u.content ?? u.text ?? '';
-          if (text) this.emit('chunk', { kind: 'text', text });
-          break;
-        }
-        case 'agent_thought_chunk':
-        case 'AgentThoughtChunk': {
-          const text = u.content?.text ?? u.content ?? u.text ?? '';
-          if (text) this.emit('chunk', { kind: 'thought', text });
-          break;
-        }
-        case 'tool_call':
-        case 'tool_call_chunk':
-          this.emit('chunk', { kind: 'thought', text: `[tool: ${u.title ?? u.name ?? 'unknown'}]\n` });
-          break;
-        case 'tool_call_update':
-          if (u.output ?? u.content?.text) {
-            this.emit('chunk', { kind: 'thought', text: u.output ?? u.content?.text });
-          }
-          break;
-        case 'plan': {
-          const entries = (u.entries ?? []).map((e) => e.content ?? e).join('\n');
-          if (entries) this.emit('chunk', { kind: 'plan', text: entries });
-          break;
-        }
-        default: dbg(`update:${this.label}`, `unhandled "${type}"`);
-      }
+    // Streaming notifications — the backend profile parses the (varied) shapes
+    if (PROFILE.updateMethods.has(msg.method)) {
+      const c = PROFILE.parseUpdate(msg.params ?? {});
+      if (!c) return;
+      if (c.kind === 'unhandled') { dbg(`update:${this.label}`, `unhandled "${c.type}"`); return; }
+      this.emit('chunk', c);
     }
+  }
+
+  // Like _req, but catches+logs instead of throwing — used for best-effort calls.
+  async _reqSafe(tag, method, params) {
+    try { return await this._req(method, params); }
+    catch (e) { log(`${tag}:${this.label}`, `${method} failed (${e.message})`); }
   }
 
   async initialize() {
     const result = await this._req('initialize', {
       protocolVersion: 1,
-      clientInfo: { name: 'acp-ollama-proxy', version: '1.0.0' },
+      clientInfo: { name: PROFILE.clientName, version: '1.0.0' },
       clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true },
     });
     const caps = result?.agentCapabilities?.promptCapabilities ?? {};
     this.promptCapabilities = caps;
     dbg(`init:${this.label}`, `promptCapabilities=${JSON.stringify(caps)}`);
+    // Codex expects the initialized notification; Kiro rejects it (profile-gated).
+    if (PROFILE.sendInitialized) this._send({ jsonrpc: '2.0', method: 'notifications/initialized' });
     this._startPing();
   }
 
-  async newSession(cwd = KIRO_CWD) {
+  async newSession(cwd = CWD) {
     const result = await this._req('session/new', { cwd, mcpServers: [] });
     this.sessionId       = result?.sessionId ?? result?.id;
     this.availableModels = result?.models?.availableModels?.map((m) => m.modelId) ?? [];
     this.currentModel    = result?.models?.currentModelId ?? 'auto';
+    // Backend-specific post-session setup (e.g. codex session/set_mode full-access)
+    await PROFILE.postNewSession(this);
     return this.sessionId;
   }
 
   async setModel(modelId) {
-    if (!modelId || modelId === 'auto' || modelId === this.currentModel) return;
-    try {
-      await this._req('session/set_model', { sessionId: this.sessionId, modelId });
-      this.currentModel = modelId;
-    } catch (e) { log(`model:${this.label}`, `set_model failed (${e.message})`); }
+    return PROFILE.setModel(this, modelId);
   }
 
   async prompt(blocks, onChunk) {
@@ -379,7 +525,7 @@ class ACPPool {
     this._queue = [];
   }
   async warmup() {
-    log('pool', `warming ${this._size} kiro-cli processes…`);
+    log('pool', `warming ${this._size} ${PROFILE.label} processes…`);
     this._slots = Array.from({ length: this._size }, () => ({ client: null, busy: false }));
     await Promise.all(this._slots.map((s) => this._initSlot(s)));
     log('pool', `ready (${this._slots.filter((s) => s.client?.alive).length}/${this._size} live)`);
@@ -455,31 +601,35 @@ class SessionRegistry {
 
 // ─── EmbeddingRegistry ────────────────────────────────────────────────────────
 
-const EMBEDDING_MODEL_MAP = {
-  BGESmallENV15: EmbeddingModel.BGESmallENV15,
-  BGEBaseENV15:  EmbeddingModel.BGEBaseENV15,
-  BGESmallEN:    EmbeddingModel.BGESmallEN,
-  BGEBaseEN:     EmbeddingModel.BGEBaseEN,
-  BGESmallZH:    EmbeddingModel.BGESmallZH,
-  AllMiniLML6V2: EmbeddingModel.AllMiniLML6V2,
-  MLE5Large:     EmbeddingModel.MLE5Large,
-};
+// Friendly model names that map 1:1 onto fastembed's EmbeddingModel enum keys.
+const EMBEDDING_MODEL_NAMES = [
+  'BGESmallENV15', 'BGEBaseENV15', 'BGESmallEN', 'BGEBaseEN', 'BGESmallZH', 'AllMiniLML6V2', 'MLE5Large',
+];
 
 class ModelNotEnabledError extends Error {}
 
 class EmbeddingRegistry {
-  constructor() { this._cache = new Map(); }
+  constructor() { this._cache = new Map(); this._installed = null; }
 
   async init() {
+    try {
+      await loadFastembed();
+    } catch (e) {
+      this._installed = false;
+      log('embeddings', `disabled — ${e.message}`);
+      return;
+    }
+    this._installed = true;
     const t0 = Date.now();
     await this.getModel(EMBEDDING_MODEL_DEFAULT);
     log('embeddings', `default model ${EMBEDDING_MODEL_DEFAULT} loaded in ${Date.now() - t0}ms (providers: ${EMBEDDING_PROVIDERS.join(',')})`);
   }
 
   async getModel(name) {
-    if (!EMBEDDING_MODELS_ENABLED.includes(name)) throw new ModelNotEnabledError(name);
+    if (!EMBEDDING_MODELS_ENABLED.includes(name) || !EMBEDDING_MODEL_NAMES.includes(name)) throw new ModelNotEnabledError(name);
     if (this._cache.has(name)) return this._cache.get(name);
-    const enumVal = EMBEDDING_MODEL_MAP[name];
+    const { EmbeddingModel, FlagEmbedding } = await loadFastembed();
+    const enumVal = EmbeddingModel[name];
     if (!enumVal) throw new ModelNotEnabledError(name);
     dbg('embeddings', `loading model ${name}`);
     const opts = { model: enumVal, executionProviders: EMBEDDING_PROVIDERS };
@@ -490,7 +640,7 @@ class EmbeddingRegistry {
   }
 
   get stats() {
-    return { loaded: [...this._cache.keys()], available: EMBEDDING_MODELS_ENABLED };
+    return { loaded: [...this._cache.keys()], available: EMBEDDING_MODELS_ENABLED, installed: this._installed !== false };
   }
 }
 
@@ -908,7 +1058,7 @@ app.get('/api/ps', (_, res) => {
 // ── Core completion handler ───────────────────────────────────────────────────
 
 async function handleOllamaCompletion(req, res, { blocks, model, stream, wantThinking, isGenerate, tools, sessionIdOverride }) {
-  const cwd      = req.headers['x-working-dir'] ?? pickCwd(blocks, KIRO_CWD);
+  const cwd      = req.headers['x-working-dir'] ?? pickCwd(blocks, CWD);
   const sessionId = req.headers['x-session-id'] ?? sessionIdOverride;
 
   let client, slot;
@@ -1010,7 +1160,7 @@ async function handleOllamaCompletion(req, res, { blocks, model, stream, wantThi
 // ── POST /api/chat ────────────────────────────────────────────────────────────
 app.post('/api/chat', async (req, res) => {
   const {
-    model    = 'auto',
+    model    = PROFILE.defaultModel,
     messages = [],
     tools,
     format,
@@ -1037,7 +1187,7 @@ app.post('/api/chat', async (req, res) => {
 // ── POST /api/generate ────────────────────────────────────────────────────────
 app.post('/api/generate', async (req, res) => {
   const {
-    model  = 'auto',
+    model  = PROFILE.defaultModel,
     prompt = '',
     system,
     images,
@@ -1159,31 +1309,31 @@ app.use((err, req, res, _next) => {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
-let _startupModels = ['auto'];
+let _startupModels = PROFILE.fallbackModels;
 try {
   const slot = await pool.acquire();
   try {
-    const result = await slot.client._req('session/new', { cwd: KIRO_CWD, mcpServers: [] });
-    dbg('startup', `session/new response: ${JSON.stringify(result)}`);
-    const ids = (result?.models?.availableModels ?? []).map((m) => m.modelId);
+    await slot.client.newSession(CWD);
+    const ids = slot.client.availableModels ?? [];
     if (ids.length) {
-      _startupModels = ['auto', ...ids.filter((id) => id !== 'auto')];
-      log('startup', `discovered ${_startupModels.length} models from binary: ${_startupModels.join(', ')}`);
+      _startupModels = PROFILE.formatStartupModels(ids);
+      log('startup', `discovered ${_startupModels.length} models from ${PROFILE.label}: ${_startupModels.join(', ')}`);
     } else {
-      log('startup', `session/new returned no model list — defaulting to ['auto']`);
+      log('startup', `session/new returned no model list — using fallback models (${_startupModels.join(', ')})`);
       log('startup', `  (set DEBUG=1 to see the raw session/new response and verify the field path)`);
     }
   } finally { pool.release(slot); }
 } catch (e) {
-  log('startup', `model discovery failed (${e.message}) — defaulting to ['auto']`);
+  log('startup', `model discovery failed (${e.message}) — using fallback models (${_startupModels.join(', ')})`);
 }
 
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, HOST, () => {
   const tokenDisplay = AUTH_TOKENS.length
     ? AUTH_TOKENS.map(t => `${t.slice(0, 18)}…`).join(', ')
     : 'OPEN (no AUTH_TOKEN set)';
   console.log(`┌──────────────────────────────────────────────────────────────┐
-│  ACP → Ollama Proxy  v1.0  —  http://localhost:${PORT}
+│  ACP → Ollama Proxy  v1.0  —  http://${HOST}:${PORT}
+│  Backend: ${PROFILE.name} (${PROFILE.cmd})
 │  Auth:    ${tokenDisplay}
 │  IP ACL:  ${ALLOWED_IPS.length ? ALLOWED_IPS.join(', ') : 'open'}
 │  Mode:    ${DEBUG ? 'DEBUG' : 'production'}  |  Pool: ${POOL_SIZE} workers  |  Ping: ${PING_INTERVAL_MS / 1000}s

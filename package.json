@@ -5,9 +5,11 @@
 	"scripts": {
 		"start": "node acp-server-ollama.js",
 		"start:dev": "DEBUG=1 node acp-server-ollama.js",
-		"codex": "node acp-server-codex.js",
-		"codex:dev": "DEBUG=1 node acp-server-codex.js",
-		"test": "node --test test/regression.test.js",
+		"openai": "node acp-server-openai.js",
+		"openai:dev": "DEBUG=1 node acp-server-openai.js",
+		"codex": "node acp-server-openai.js",
+		"codex:dev": "DEBUG=1 node acp-server-openai.js",
+		"test": "node --test test/*.test.js",
 		"format": "biome format --write .",
 		"check": "biome check --write ."
 	},
