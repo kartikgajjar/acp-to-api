@@ -2,17 +2,17 @@
 	"name": "acp-openai-proxy",
 	"version": "3.0.0",
 	"type": "module",
-	"main": "kiro-api-bridge-server.js",
 	"scripts": {
-		"start": "node kiro-api-bridge-server.js",
-		"dev": "DEBUG=1 node kiro-api-bridge-server.js",
-		"full": "POOL_SIZE=1 node kiro-api-bridge-server-full.js",
-		"full_pool": "POOL_SIZE=4 node kiro-api-bridge-server-full.js",
+		"start": "node acp-server-ollama.js",
+		"start:dev": "DEBUG=1 node acp-server-ollama.js",
+		"codex": "node acp-server-codex.js",
+		"codex:dev": "DEBUG=1 node acp-server-codex.js",
 		"test": "node --test test/regression.test.js",
 		"format": "biome format --write .",
 		"check": "biome check --write ."
 	},
 	"dependencies": {
+		"@zed-industries/codex-acp": "*",
 		"cors": "^2.8.5",
 		"dotenv": "^17.4.2",
 		"express": "^5.2.0"
