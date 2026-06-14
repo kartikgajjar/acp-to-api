@@ -35,6 +35,10 @@ const CWD              = process.env.ACP_CWD ?? process.env.KIRO_CWD ?? process.
 const DEBUG            = process.env.DEBUG                     === '1';
 const POOL_SIZE        = parseInt(process.env.POOL_SIZE        ?? '4');
 const POOL_PRECREATE   = process.env.POOL_PRECREATE           === '1';
+// Trim the system prompt on a REUSED stateful thread: codex already has it from the
+// first turn, so re-sending it every turn re-prefills it (defeating the prefix cache).
+// Experimental/opt-in — relies on codex retaining the first-turn system instructions.
+const TRIM_SYSTEM_ON_REUSE = process.env.TRIM_SYSTEM_ON_REUSE === '1';
 const SESSION_TTL_MS   = parseInt(process.env.SESSION_TTL_MS   ?? String(30 * 60 * 1000));
 const PING_INTERVAL_MS = parseInt(process.env.PING_INTERVAL    ?? '60000');
 const MAX_EXEC_MS      = parseInt(process.env.MAX_EXEC_MS      ?? String(10 * 60 * 1000));
@@ -1268,8 +1272,17 @@ app.post('/v1/chat/completions', async (req, res) => {
     return apiError(res, 503, `ACP backend unavailable: ${err.message}`, 'api_error');
   }
 
+  // On a reused stateful thread, drop the system prompt (already established turn 1)
+  // so it isn't re-prefilled. Only for real registry reuse — never the stateless pool.
+  let promptBlocks = blocks;
+  const trimmedSystem = TRIM_SYSTEM_ON_REUSE && sessionId && sessionState === 'reuse';
+  if (trimmedSystem) {
+    const trimmed = messages.filter(m => m.role !== 'system');
+    if (trimmed.length) promptBlocks = buildAcpBlocks(trimmed, tools, { response_format, tool_choice });
+  }
+
   const timingMeta = { rid: req.id, model, mode: PROFILE.mode, tools: !!tools?.length, stream,
-    session: sessionState, promptChars: promptCharLen(blocks), nMessages: messages.length, nTools: tools?.length ?? 0 };
+    session: trimmedSystem ? 'reuse-trim' : sessionState, promptChars: promptCharLen(promptBlocks), nMessages: messages.length, nTools: tools?.length ?? 0 };
 
   // Timeout race
   let timedOut = false;
@@ -1298,7 +1311,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       });
 
       const streamPromise = (async () => {
-        await client.prompt(blocks, chunk => {
+        await client.prompt(promptBlocks, chunk => {
           if (disconnected || timedOut) return;
           allChunks.push(chunk);
           if (!res.writable) return;
@@ -1345,7 +1358,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       if (!disconnected && !timedOut) recordTiming(marks, timingMeta, allChunks);
 
     } else {
-      const promptPromise = client.prompt(blocks, undefined, marks);
+      const promptPromise = client.prompt(promptBlocks, undefined, marks);
       const chunks        = await Promise.race([promptPromise, timeoutPromise]);
 
       if (timedOut) {
@@ -1357,7 +1370,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       const timing           = recordTiming(marks, timingMeta, chunks);
       const elapsed          = timing.total_ms ?? Number(process.hrtime.bigint() - marks.t_req_start) / 1e6;
-      const promptTxt        = blocks.map(b => b.text ?? '').join('');
+      const promptTxt        = promptBlocks.map(b => b.text ?? '').join('');
       const promptTokens     = message.promptTokens     || estimateTokens(promptTxt);
       const completionTokens = message.completionTokens || estimateTokens(message.content);
 

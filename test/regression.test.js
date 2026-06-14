@@ -713,6 +713,39 @@ describe('X-Clear-Context resets a persistent session without respawn', () => {
   });
 });
 
+// ─── TRIM_SYSTEM_ON_REUSE ─────────────────────────────────────────────────────
+
+describe('TRIM_SYSTEM_ON_REUSE drops the system prompt on a reused thread', () => {
+  let srv;
+  before(async () => { srv = await startServer({ DEBUG: '1', TRIM_SYSTEM_ON_REUSE: '1' }); });
+  after(async  () => await srv.kill());
+
+  const SID = 'trim-session';
+  const bigSystem = `You are a classifier. ${'rule '.repeat(300)}`;
+  async function timingFor(rid) {
+    const r = await req(srv.port, '/debug/timings');
+    return (await r.json()).data.find(t => t.rid === rid);
+  }
+
+  test('first turn (new) sends the full system prompt', async () => {
+    await chat(srv.port,
+      { model: 'auto', messages: [{ role: 'system', content: bigSystem }, { role: 'user', content: 'hi' }] },
+      { headers: { 'X-Session-Id': SID, 'X-Request-Id': 'trim-a' } });
+    const t = await timingFor('trim-a');
+    assert.equal(t.session, 'new');
+    assert.ok(t.prompt_chars > 500, 'full system prompt counted');
+  });
+
+  test('reused turn trims the system prompt (smaller prompt, session=reuse-trim)', async () => {
+    await chat(srv.port,
+      { model: 'auto', messages: [{ role: 'system', content: bigSystem }, { role: 'user', content: 'hello again' }] },
+      { headers: { 'X-Session-Id': SID, 'X-Request-Id': 'trim-b' } });
+    const t = await timingFor('trim-b');
+    assert.equal(t.session, 'reuse-trim');
+    assert.ok(t.prompt_chars < 100, `system stripped on reuse (got ${t.prompt_chars} chars)`);
+  });
+});
+
 // ─── AUTO_SESSION_HASH ────────────────────────────────────────────────────────
 
 describe('AUTO_SESSION_HASH routing', () => {
