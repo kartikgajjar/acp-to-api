@@ -222,6 +222,38 @@ describe('reasoning_effort forwarding', () => {
   });
 });
 
+// ─── Ollama interface parity: reasoning (think) + X-Clear-Context ──────────────
+
+describe('ollama interface parity', () => {
+  test('think level maps to reasoning_effort on codex', async () => {
+    const srv = await startServer({ server: 'ollama', backend: 'codex', env: { MOCK_SCENARIO: 'PROTOCOL', CODEX_REASONING_EFFORT: '' } });
+    try {
+      const { json } = await postJson(srv.port, '/api/chat', { model: 'auto', think: 'low', stream: false, messages: [{ role: 'user', content: 'hi' }] });
+      const seen = JSON.parse(json?.message?.content ?? '{}');
+      assert.equal(seen.reasoning, 'low', 'think level forwarded as reasoning_effort');
+    } finally { await srv.kill(); }
+  });
+
+  test('X-Clear-Context resets a persistent session (session/new on warm process)', async () => {
+    const srv = await startServer({ server: 'ollama', backend: 'codex', env: { DEBUG: '1' } });
+    try {
+      const SID = 'oll-logical-1';
+      const timing = async (rid) => {
+        const r = await fetch(`http://127.0.0.1:${srv.port}/debug/timings`);
+        const { data } = await r.json();
+        return data.find(t => t.rid === rid);
+      };
+      await postJson(srv.port, '/api/chat', { model: 'auto', stream: false, messages: [{ role: 'user', content: 't1' }] }, { 'X-Session-Id': SID, 'X-Request-Id': 'oll-1' });
+      await postJson(srv.port, '/api/chat', { model: 'auto', stream: false, messages: [{ role: 'user', content: 't2' }] }, { 'X-Session-Id': SID, 'X-Request-Id': 'oll-2' });
+      const t2 = await timing('oll-2');
+      assert.equal(t2.session_new_ms, null, 'reuse → no session/new on the warm thread');
+      await postJson(srv.port, '/api/chat', { model: 'auto', stream: false, messages: [{ role: 'user', content: 't3' }] }, { 'X-Session-Id': SID, 'X-Request-Id': 'oll-3', 'X-Clear-Context': '1' });
+      const t3 = await timing('oll-3');
+      assert.ok(t3.session_new_ms != null, 'clear → session/new ran on the warm process');
+    } finally { await srv.kill(); }
+  });
+});
+
 // ─── Tool-arg format tracks the INTERFACE, not the backend ─────────────────────
 
 describe('tool-call argument format is interface-determined', () => {

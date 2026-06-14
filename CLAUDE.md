@@ -59,15 +59,21 @@ npm run check    # biome check --write . (format + lint)
 | `PORT` | `11434` | |
 | `KIRO_CMD` | `kiro-cli` | |
 | `POOL_SIZE` | `4` | Pre-warmed processes |
+| `POOL_PRECREATE` | `0` | `1` = pre-create + recycle pool sessions (see OpenAI section — situational). |
+| `CODEX_REASONING_EFFORT` | `low` | Default reasoning effort (codex backend; no-op for kiro). The Ollama `think` field, when a level string (`low`/`medium`/`high`/…), overrides per-request; otherwise this default applies. Empty disables. |
 | `AUTH_TOKEN` | _(none)_ | Bearer tokens (comma-sep); unset = open |
 | `ALLOWED_IPS` | _(none)_ | IP allowlist |
 | `AUTO_SESSION_HASH` | `0` | `1` = hash system prompt → session id |
-| `DEBUG` | `0` | `1` = verbose stderr + monolithic log file under `logs/` |
+| `DEBUG` | `0` | `1` = verbose stderr + monolithic log file under `logs/`; also enables `GET /debug/timings` |
 | `LOG_DIR` | `./logs` | Override log file directory (only used when `DEBUG=1`) |
 
 ### Implemented endpoints
 
-`POST /api/chat`, `POST /api/generate`, `GET /api/tags`, `POST /api/show`, `GET /api/ps`, `POST /api/embed`, `POST /api/embeddings`, `GET /api/version`, `GET /health`, `GET /health/agents`, `DELETE /v1/sessions/:id`
+`POST /api/chat`, `POST /api/generate`, `GET /api/tags`, `POST /api/show`, `GET /api/ps`, `POST /api/embed`, `POST /api/embeddings`, `GET /api/version`, `GET /health`, `GET /health/agents`, `GET /debug/timings` (DEBUG), `DELETE /v1/sessions/:id`
+
+### Latency features (parity with the OpenAI server)
+
+Both servers share the same latency tooling and controls: per-request timing split (`[DBG:timing]` + `GET /debug/timings` under `DEBUG`), `POOL_PRECREATE`, `CODEX_REASONING_EFFORT` (Ollama sources the per-request effort from the `think` level), and **`X-Clear-Context: 1`** to reset a persistent `X-Session-Id` between logical sessions without respawn (codex thread restart on the warm process). See the OpenAI section for the measured latency reality and the `reasoning_effort`/`X-Clear-Context` semantics — they apply identically here.
 
 ### Protocol quirks
 

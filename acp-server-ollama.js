@@ -72,6 +72,7 @@ const CWD              = process.env.ACP_CWD ?? process.env.KIRO_CWD ?? process.
 const DEBUG            = process.env.DEBUG                     === '1';
 
 const POOL_SIZE        = parseInt(process.env.POOL_SIZE        ?? '4');
+const POOL_PRECREATE   = process.env.POOL_PRECREATE           === '1';
 const SESSION_TTL_MS   = parseInt(process.env.SESSION_TTL_MS   ?? String(30 * 60 * 1000));
 const PING_INTERVAL_MS = parseInt(process.env.PING_INTERVAL    ?? '60000');
 const MAX_EXEC_MS      = parseInt(process.env.MAX_EXEC_MS      ?? String(10 * 60 * 1000));
@@ -288,6 +289,47 @@ function makeToolCallId() { return `call_${randomUUID().replace(/-/g, '').slice(
 function makeReqId()      { return `req_${randomUUID().replace(/-/g, '').slice(0, 24)}`; }
 function nowSec()         { return Math.floor(Date.now() / 1000); }
 
+// Reasoning effort: codex maps these to ReasoningEffort (no-op for kiro). The Ollama
+// `think` field, when a level string, selects the effort; otherwise CODEX_REASONING_EFFORT
+// applies. Default 'low' for low TTFT (codex-acp 0.16.0 rejects minimal/none for its
+// default preset; unsupported values no-op via _reqSafe). Set empty to disable.
+const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
+const _reasoningDefaultEnv = process.env.CODEX_REASONING_EFFORT ?? 'low';
+const REASONING_DEFAULT = REASONING_EFFORTS.has(_reasoningDefaultEnv) ? _reasoningDefaultEnv : null;
+function reasoningFrom(think) {
+  return REASONING_EFFORTS.has(think) ? think : REASONING_DEFAULT;
+}
+
+// ─── Latency instrumentation ──────────────────────────────────────────────────
+// process.hrtime.bigint() stamps threaded via a `marks` object; recordTiming() turns
+// them into a machine-readable per-request split, surfaced at GET /debug/timings (DEBUG).
+function _ns2ms(a, b) {
+  return a != null && b != null ? Number((Number(b - a) / 1e6).toFixed(1)) : null;
+}
+const _timings = [];
+const _TIMINGS_MAX = 200;
+function recordTiming(marks, meta) {
+  const m = marks;
+  const rec = {
+    rid: meta.rid, model: meta.model, tools: meta.tools, stream: meta.stream,
+    acquire_ms:       _ns2ms(m.t_req_start, m.t_acquired),
+    session_new_ms:   _ns2ms(m.t_acquired, m.t_session_created),
+    set_mode_ms:      _ns2ms(m.t_session_created, m.t_post_session),
+    set_model_ms:     _ns2ms(m.t_post_session ?? m.t_acquired, m.t_set_model),
+    prefill_ms:       _ns2ms(m.t_prompt_sent, m.t_first_update),
+    thought_gap_ms:   _ns2ms(m.t_first_update, m.t_first_thought),
+    reasoning_gap_ms: _ns2ms(m.t_first_update, m.t_first_text),
+    gen_ms:           _ns2ms(m.t_first_text, m.t_complete),
+    total_ms:         _ns2ms(m.t_req_start, m.t_complete),
+  };
+  if (DEBUG) {
+    _timings.push(rec);
+    if (_timings.length > _TIMINGS_MAX) _timings.shift();
+    dbg('timing', JSON.stringify(rec));
+  }
+  return rec;
+}
+
 // Derive a stable session ID from the system message content.
 // Same system prompt → same session, so conversation context survives across turns.
 function autoSessionId(messages) {
@@ -341,6 +383,8 @@ class ACPSession extends EventEmitter {
     this._msgId     = 0;
     this._pending   = new Map();
     this.sessionId  = null;
+    this.sessionCwd = null;          // cwd the active session was created with (pool reuse)
+    this._sessionConsumed = false;   // true once a stateless turn has used this session
     this._pingTimer = null;
     this._dead      = false;
   }
@@ -464,13 +508,17 @@ class ACPSession extends EventEmitter {
     this._startPing();
   }
 
-  async newSession(cwd = CWD) {
+  async newSession(cwd = CWD, timings) {
     const result = await this._req('session/new', { cwd, mcpServers: [] });
+    if (timings) timings.t_session_created = process.hrtime.bigint();
+    this.sessionCwd       = cwd;
+    this._sessionConsumed = false;
     this.sessionId       = result?.sessionId ?? result?.id;
     this.availableModels = result?.models?.availableModels?.map((m) => m.modelId) ?? [];
     this.currentModel    = result?.models?.currentModelId ?? 'auto';
     // Backend-specific post-session setup (e.g. codex session/set_mode full-access)
     await PROFILE.postNewSession(this);
+    if (timings) timings.t_post_session = process.hrtime.bigint();
     return this.sessionId;
   }
 
@@ -478,16 +526,27 @@ class ACPSession extends EventEmitter {
     return PROFILE.setModel(this, modelId);
   }
 
-  async prompt(blocks, onChunk) {
+  async setReasoning(effort) {
+    return PROFILE.setReasoning(this, effort);
+  }
+
+  async prompt(blocks, onChunk, timings) {
     const chunks = [];
     let textLen = 0;
     const handler = (c) => {
+      if (timings) {
+        const now = process.hrtime.bigint();
+        if (timings.t_first_update  == null) timings.t_first_update  = now;
+        if (c.kind === 'thought' && timings.t_first_thought == null) timings.t_first_thought = now;
+        if (c.kind === 'text'    && timings.t_first_text    == null) timings.t_first_text    = now;
+      }
       chunks.push(c);
       if (c.kind === 'text') textLen += c.text.length;
       onChunk?.(c);
     };
     this.on('chunk', handler);
     dbg(`prompt:${this.label}`, `streaming…`);
+    if (timings) timings.t_prompt_sent = process.hrtime.bigint();
     try {
       await this._req('session/prompt', {
         sessionId: this.sessionId,
@@ -497,6 +556,7 @@ class ACPSession extends EventEmitter {
     } finally {
       this.off('chunk', handler);
     }
+    if (timings) timings.t_complete = process.hrtime.bigint();
     dbg(`prompt:${this.label}`, `done  chunks=${chunks.length}  textChars=${textLen}`);
     return chunks;
   }
@@ -539,13 +599,20 @@ class ACPPool {
     try {
       const c = new ACPSession(`pool-${this._slots.indexOf(slot)}`);
       await c.start(); await c.initialize();
+      // POOL_PRECREATE: pre-pay session/new + set_mode at warmup (recycled on release).
+      if (POOL_PRECREATE) await c.newSession(CWD);
       c.once('dead', () => { slot.client = null; });
       slot.client = c;
     } catch (e) { log('pool', `slot init failed: ${e.message}`); slot.client = null; }
   }
   async acquire() {
     const free = this._slots.find((s) => !s.busy);
-    if (free) { free.busy = true; if (!free.client?.alive) await this._initSlot(free); return free; }
+    if (free) {
+      free.busy = true;
+      if (free._recycle) { try { await free._recycle; } catch {} }
+      if (!free.client?.alive) await this._initSlot(free);
+      return free;
+    }
     return new Promise((resolve) => this._queue.push(resolve));
   }
   release(slot) {
@@ -555,6 +622,14 @@ class ACPPool {
       slot.busy = true;
       if (!slot.client?.alive) this._initSlot(slot).then(() => next(slot));
       else next(slot);
+      return;
+    }
+    // No waiter: recycle a consumed session in the background so the next acquirer gets
+    // a fresh, isolated, already-warm session. The handler re-creates inline if needed.
+    if (POOL_PRECREATE && slot.client?.alive && slot.client._sessionConsumed) {
+      slot._recycle = slot.client.newSession(CWD)
+        .catch((e) => log('pool', `recycle failed: ${e.message}`))
+        .finally(() => { slot._recycle = null; });
     }
   }
   shutdown() { this._slots.forEach((s) => s.client?.close()); }
@@ -581,15 +656,17 @@ class SessionRegistry {
       this._map.delete(sessionId);
       entry = null;
     }
+    let created = false;
     if (!entry) {
       const c = new ACPSession(`reg-${sessionId.slice(0, 8)}`);
       await c.start(); await c.initialize(); await c.newSession(cwd);
+      created = true;
       entry = { client: c, lastUsed: Date.now() };
       this._map.set(sessionId, entry);
     } else {
       entry.lastUsed = Date.now();
     }
-    return entry.client;
+    return { client: entry.client, created };
   }
   delete(sessionId) {
     const entry = this._map.get(sessionId);
@@ -973,6 +1050,7 @@ if (DEBUG) {
 // Auth + IP allowlist — exempt root, version, and health
 app.use((req, res, next) => {
   if (req.path === '/' || req.path === '/api/version' || req.path === '/health') return next();
+  if (DEBUG && req.path === '/debug/timings') return next();
 
   if (ALLOWED_IPS.length > 0) {
     const ip = (req.headers['x-forwarded-for']?.split(',')[0] ?? req.socket.remoteAddress ?? '').replace('::ffff:', '');
@@ -996,6 +1074,13 @@ app.get('/api/version', (_, res) => res.json({ version: '0.9.0' }));
 app.get('/health', (_, res) => {
   res.json({ status: 'ok', pool: pool.stats, registry: registry.stats, embeddings: embeddings.stats });
 });
+
+// Latency split ring buffer — DEBUG only, unauthenticated like /health
+if (DEBUG) {
+  app.get('/debug/timings', (_, res) => {
+    res.json({ object: 'list', count: _timings.length, data: _timings });
+  });
+}
 
 app.get('/health/agents', (_, res) => {
   res.json({
@@ -1071,22 +1156,38 @@ app.get('/api/ps', (_, res) => {
 
 // ── Core completion handler ───────────────────────────────────────────────────
 
-async function handleOllamaCompletion(req, res, { blocks, model, stream, wantThinking, isGenerate, tools, sessionIdOverride }) {
+async function handleOllamaCompletion(req, res, { blocks, model, stream, wantThinking, isGenerate, tools, sessionIdOverride, effort }) {
   const cwd      = req.headers['x-working-dir'] ?? pickCwd(blocks, CWD);
   const sessionId = req.headers['x-session-id'] ?? sessionIdOverride;
+  // Logical-session boundary: clear context on a persistent session without respawn
+  // (codex-acp has no /clear; reset by starting a fresh thread on the same process).
+  const clearContext = /^(1|true|reset|yes)$/i.test(req.headers['x-clear-context'] ?? '');
+  const rid = req.headers['x-request-id'] || makeReqId();
 
-  let client, slot;
+  let client, slot, created;
+  const marks = { t_req_start: process.hrtime.bigint() };
   if (sessionId) {
-    client = await registry.acquire(sessionId, cwd);
+    ({ client, created } = await registry.acquire(sessionId, cwd));
+    marks.t_acquired = process.hrtime.bigint();
+    if (clearContext && !created) await client.newSession(cwd, marks);
     await client.setModel(model);
+    await client.setReasoning(effort);
+    marks.t_set_model = process.hrtime.bigint();
   } else {
     slot   = await pool.acquire();
     client = slot.client;
-    await client.newSession(cwd);
+    marks.t_acquired = process.hrtime.bigint();
+    // Reuse a pre-created, unconsumed session for the same cwd (POOL_PRECREATE).
+    const reuse = POOL_PRECREATE && client.sessionId && !client._sessionConsumed && client.sessionCwd === cwd;
+    if (!reuse) await client.newSession(cwd, marks);
+    client._sessionConsumed = true;
     await client.setModel(model);
+    await client.setReasoning(effort);
+    marks.t_set_model = process.hrtime.bigint();
   }
 
-  const startNs = process.hrtime.bigint();
+  const timingMeta = { rid, model, tools: !!tools?.length, stream };
+  const startNs = marks.t_req_start;
 
   try {
     if (stream) {
@@ -1114,7 +1215,8 @@ async function handleOllamaCompletion(req, res, { blocks, model, stream, wantThi
             res.write(ndjsonLine({ model, created_at: new Date().toISOString(), message: { role: 'assistant', content: '', thinking: chunk.text }, done: false }));
           }
         }
-      });
+      }, marks);
+      recordTiming(marks, timingMeta);
 
       if (isGenerate) {
         const textChunks = allChunks.filter((c) => c.kind === 'text').map((c) => c.text).join('');
@@ -1139,7 +1241,8 @@ async function handleOllamaCompletion(req, res, { blocks, model, stream, wantThi
       res.end();
 
     } else {
-      const chunks = await client.prompt(blocks);
+      const chunks = await client.prompt(blocks, undefined, marks);
+      recordTiming(marks, timingMeta);
 
       if (isGenerate) {
         const textContent = chunks.filter((c) => c.kind === 'text').map((c) => c.text).join('');
@@ -1195,7 +1298,7 @@ app.post('/api/chat', async (req, res) => {
   dbg('chat', `tools=${JSON.stringify(tools ?? null)}  format=${JSON.stringify(format ?? null)}`);
   if (sessionIdOverride) dbg('chat', `auto-session=${sessionIdOverride}`);
 
-  await handleOllamaCompletion(req, res, { blocks, model, stream, wantThinking, isGenerate: false, tools, sessionIdOverride });
+  await handleOllamaCompletion(req, res, { blocks, model, stream, wantThinking, isGenerate: false, tools, sessionIdOverride, effort: reasoningFrom(think) });
 });
 
 // ── POST /api/generate ────────────────────────────────────────────────────────
@@ -1218,7 +1321,7 @@ app.post('/api/generate', async (req, res) => {
   const wantThinking = !!think;
   const blocks       = buildAcpBlocksFromGenerate(prompt, system, images, { format, think });
 
-  await handleOllamaCompletion(req, res, { blocks, model, stream, wantThinking, isGenerate: true });
+  await handleOllamaCompletion(req, res, { blocks, model, stream, wantThinking, isGenerate: true, effort: reasoningFrom(think) });
 });
 
 // ── Embeddings ────────────────────────────────────────────────────────────────
