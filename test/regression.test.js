@@ -608,6 +608,67 @@ describe('POOL_PRECREATE pre-creates + recycles pool sessions', () => {
   });
 });
 
+// ─── Responses API (/v1/responses) + /models alias ────────────────────────────
+
+describe('Responses API and /models alias', () => {
+  let srv;
+  before(async () => { srv = await startServer(); });
+  after(async  () => await srv.kill());
+
+  test('GET /models (no /v1) returns the model list', async () => {
+    const r = await req(srv.port, '/models');
+    assert.equal(r.status, 200);
+    const j = await r.json();
+    assert.equal(j.object, 'list');
+    assert.ok(Array.isArray(j.data) && j.data.length >= 1);
+  });
+
+  test('POST /v1/responses (string input) returns a Responses object', async () => {
+    const r = await req(srv.port, '/v1/responses', { method: 'POST', body: { model: 'auto', input: 'hello', stream: false } });
+    assert.equal(r.status, 200);
+    const j = await r.json();
+    assert.equal(j.object, 'response');
+    assert.equal(j.status, 'completed');
+    assert.ok(typeof j.output_text === 'string' && j.output_text.length > 0, 'has output_text');
+    const msg = j.output[j.output.length - 1];
+    assert.equal(msg.type, 'message');
+    assert.equal(msg.content[0].type, 'output_text');
+    assert.ok(j.usage.total_tokens >= 0);
+  });
+
+  test('POST /v1/responses (array input + instructions)', async () => {
+    const r = await req(srv.port, '/v1/responses', { method: 'POST', body: {
+      model: 'auto', instructions: 'You are terse.',
+      input: [{ type: 'message', role: 'user', content: 'hi' }], stream: false,
+    } });
+    assert.equal(r.status, 200);
+    const j = await r.json();
+    assert.ok(j.output_text.length > 0);
+  });
+
+  test('POST /responses (no /v1) also works', async () => {
+    const r = await req(srv.port, '/responses', { method: 'POST', body: { model: 'auto', input: 'hi', stream: false } });
+    assert.equal(r.status, 200);
+    assert.equal((await r.json()).object, 'response');
+  });
+
+  test('empty input → 400', async () => {
+    const r = await req(srv.port, '/v1/responses', { method: 'POST', body: { model: 'auto', input: [] } });
+    assert.equal(r.status, 400);
+  });
+
+  test('POST /v1/responses streaming emits the response.* event sequence', async () => {
+    const r = await fetch(`http://127.0.0.1:${srv.port}/v1/responses`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'auto', input: 'hi', stream: true }),
+    });
+    const text = await r.text();
+    assert.match(text, /event: response\.created/);
+    assert.match(text, /event: response\.output_text\.delta/);
+    assert.match(text, /event: response\.completed/);
+  });
+});
+
 // ─── X-Clear-Context (logical-session boundary) ───────────────────────────────
 
 describe('X-Clear-Context resets a persistent session without respawn', () => {

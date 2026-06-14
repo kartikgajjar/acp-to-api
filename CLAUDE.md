@@ -11,7 +11,7 @@ Two standalone ACP-to-HTTP shims. **The file name = the REST interface it expose
 | File | REST surface | Default port | Default backend |
 |---|---|---|---|
 | `acp-server-ollama.js` | Ollama REST (`/api/chat`, `/api/tags`, embeddings, …) | 11434 | `kiro` |
-| `acp-server-openai.js` | OpenAI REST (`/v1/chat/completions`, `/v1/models`) | 3456 | `codex` |
+| `acp-server-openai.js` | OpenAI REST (`/v1/chat/completions`, `/v1/responses`, `/v1/models`) | 3456 | `codex` |
 
 **Backends** (`--backend=kiro|codex`): defined as a single `BACKENDS` map that is kept **byte-identical** in both files (a regression test enforces this — edit both copies together; markers `// >>> BACKENDS` … `// <<< BACKENDS`). The map is the source of truth for every per-backend quirk (spawn cmd/args, `notifications/initialized`, `session/set_mode`, model-switch method, notification parsing, debug filtering). A single `ACPSession` consumes the selected `PROFILE` with no backend `if`-branches.
 
@@ -161,9 +161,16 @@ Both serialization styles are handled in `_route`:
 - **Logical-session boundary — `X-Clear-Context: 1`** (also `reset`/`true`/`yes`): clears the conversation on a persistent `X-Session-Id` between unrelated tasks **without** respawning the process. codex-acp 0.16.0 has no `/clear` command (only `/compact`, which summarizes), so the proxy resets by starting a fresh codex thread (`session/new`) on the same warm process — clean context, no cross-task bleed, and the OpenAI system-prompt prefix cache survives. Skipped on a just-created session. Verified end-to-end: warm turn recalls a fact, the post-clear turn does not. The cleared turn pays `session/new` (~5 s) but avoids process spawn + initialize.
 - `MAX_EXEC_MS` enforced via `Promise.race([promptPromise, timeoutPromise])` → cancel + 504 on timeout.
 
+### Endpoints
+
+- `POST /v1/chat/completions` — Chat Completions (streaming + non-streaming).
+- `POST /v1/responses` and `POST /responses` — **OpenAI Responses API** (used by clients like Langflow). Translates `input` (string or array of `{type:'message',role,content}` items) + optional top-level `instructions` into the same ACP turn; returns a `response` object with `output[]` + `output_text` + `usage` (non-stream) or the `response.created → response.output_text.delta* → response.completed` SSE event sequence (stream). Honors `reasoning.effort`, `X-Session-Id`, and `X-Clear-Context`.
+- `GET /v1/models` and `GET /models` (alias) — model list.
+- `GET /health`, `GET /` (open); `GET /debug/timings` (DEBUG).
+
 ### OpenAI compatibility
 
-Supported: `model`, `messages`, `stream`, `tools`, `tool_choice`, `response_format.type = 'json_object'`, `reasoning_effort` (codex backend; mapped to a reasoning config option — see Protocol differences).
+Supported (chat + responses): `model`, `messages`/`input`, `instructions` (responses), `stream`, `tools`, `tool_choice`, `response_format.type = 'json_object'`, `reasoning_effort` / `reasoning.effort` (codex backend; mapped to a reasoning config option — see Protocol differences).
 
 Accepted and **silently ignored** (off-the-shelf clients don't 400): `temperature`, `max_tokens`, `top_p`, `seed`, `stop`, `n`, `logprobs`, `parallel_tool_calls`, `stream_options`, `user`, `service_tier`.
 

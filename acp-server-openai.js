@@ -1100,7 +1100,7 @@ if (DEBUG) {
 
 // ── Models ────────────────────────────────────────────────────────────────────
 
-app.get('/v1/models', (_, res) => {
+function modelsHandler(_, res) {
   res.json({
     object: 'list',
     data: _startupModels.map(id => ({
@@ -1110,7 +1110,94 @@ app.get('/v1/models', (_, res) => {
       owned_by: PROFILE.name,
     })),
   });
-});
+}
+// `/models` (no /v1) is used by some clients (e.g. Langflow) — serve both.
+app.get('/v1/models', modelsHandler);
+app.get('/models', modelsHandler);
+
+// Acquire a backend session for one turn: pool (stateless) or registry (stateful),
+// applying clear-context reset, model, and reasoning, and stamping timing marks.
+// Throws on failure (releasing any pool slot first); callers map that to a 503.
+async function acquireTurn({ sessionId, cwd, clearContext, model, effort, marks }) {
+  let client, release, slot, created;
+  try {
+    if (sessionId) {
+      ({ client, release, created } = await registry.acquire(sessionId, cwd));
+      marks.t_acquired = process.hrtime.bigint();
+      // Reset the thread for a new logical session (skip if just created — already fresh).
+      if (clearContext && !created) await client.newSession(cwd, marks);
+    } else {
+      slot   = await pool.acquire();
+      client = slot.client;
+      marks.t_acquired = process.hrtime.bigint();
+      const reuse = POOL_PRECREATE && client.sessionId && !client._sessionConsumed && client.sessionCwd === cwd;
+      if (!reuse) await client.newSession(cwd, marks);
+      client._sessionConsumed = true;
+    }
+    await client.setModel(model);
+    await client.setReasoning(effort);
+    marks.t_set_model = process.hrtime.bigint();
+  } catch (err) {
+    if (slot) pool.release(slot);
+    throw err;
+  }
+  return { client, release, slot };
+}
+
+// Resolve an effort from a request value, falling back to the server default.
+function resolveEffort(value) {
+  return (REASONING_EFFORTS.has(value) ? value : null) ?? REASONING_DEFAULT;
+}
+
+// ── Responses API helpers ───────────────────────────────────────────────────────
+// Flatten the Responses `input` (string or array of input items) + optional
+// top-level `instructions` into chat-style messages we already know how to render.
+function responsesInputToMessages(input, instructions) {
+  const messages = [];
+  if (instructions) messages.push({ role: 'system', content: String(instructions) });
+  const partText = c => (typeof c === 'string' ? c : (c?.text ?? c?.input_text ?? ''));
+  const push = item => {
+    if (item == null) return;
+    if (typeof item === 'string') { messages.push({ role: 'user', content: item }); return; }
+    if (item.type && item.type !== 'message') return; // skip function_call_output etc. (MVP)
+    const role = item.role ?? 'user';
+    const content = Array.isArray(item.content) ? item.content.map(partText).join('') : partText(item.content);
+    if (content) messages.push({ role, content });
+  };
+  if (typeof input === 'string') messages.push({ role: 'user', content: input });
+  else if (Array.isArray(input)) input.forEach(push);
+  return messages;
+}
+
+// Responses tool shape ({type:'function', name, …}) → chat tool shape for buildAcpBlocks.
+function responsesToolsToChat(tools) {
+  if (!Array.isArray(tools) || !tools.length) return undefined;
+  const mapped = tools
+    .filter(t => t?.type === 'function')
+    .map(t => ({ type: 'function', function: t.function ?? { name: t.name, description: t.description, parameters: t.parameters } }));
+  return mapped.length ? mapped : undefined;
+}
+
+function buildResponsesObject(id, model, content, toolCalls, promptTokens, completionTokens) {
+  const output = [];
+  for (const tc of toolCalls ?? []) {
+    output.push({
+      type: 'function_call', status: 'completed',
+      id: `fc_${randomUUID().replace(/-/g, '').slice(0, 24)}`,
+      call_id: tc.id, name: tc.function.name, arguments: tc.function.arguments,
+    });
+  }
+  output.push({
+    type: 'message', status: 'completed', role: 'assistant',
+    id: `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`,
+    content: [{ type: 'output_text', text: content ?? '', annotations: [] }],
+  });
+  return {
+    id, object: 'response', created_at: nowSec(), model, status: 'completed',
+    output, output_text: content ?? '',
+    usage: { input_tokens: promptTokens, output_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
+  };
+}
 
 // ── Chat completions ──────────────────────────────────────────────────────────
 
@@ -1132,7 +1219,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   // none|minimal|low|medium|high|xhigh; the backend validates against the model
   // preset and a _reqSafe no-ops if unsupported. A request value wins; otherwise the
   // server default (REASONING_DEFAULT) applies. Unknown request values fall back too.
-  const effort = (REASONING_EFFORTS.has(reasoning_effort) ? reasoning_effort : null) ?? REASONING_DEFAULT;
+  const effort = resolveEffort(reasoning_effort);
 
   if (!Array.isArray(messages) || !messages.length) {
     return apiError(res, 400, '`messages` is required and must be a non-empty array',
@@ -1148,33 +1235,12 @@ app.post('/v1/chat/completions', async (req, res) => {
   const clearContext = /^(1|true|reset|yes)$/i.test(req.headers['x-clear-context'] ?? '');
   const id        = makeId();
 
-  let client, release, slot, created;
+  let client, release, slot;
   const marks = { t_req_start: process.hrtime.bigint() };
 
   try {
-    if (sessionId) {
-      ({ client, release, created } = await registry.acquire(sessionId, cwd));
-      marks.t_acquired = process.hrtime.bigint();
-      // Reset the thread for a new logical session (skip if just created — already fresh).
-      if (clearContext && !created) await client.newSession(cwd, marks);
-      await client.setModel(model);
-      await client.setReasoning(effort);
-      marks.t_set_model = process.hrtime.bigint();
-    } else {
-      slot   = await pool.acquire();
-      client = slot.client;
-      marks.t_acquired = process.hrtime.bigint();
-      // Reuse a pre-created, unconsumed session for the same cwd (POOL_PRECREATE);
-      // otherwise create one now. Either way the turn consumes it (recycled on release).
-      const reuse = POOL_PRECREATE && client.sessionId && !client._sessionConsumed && client.sessionCwd === cwd;
-      if (!reuse) await client.newSession(cwd, marks);
-      client._sessionConsumed = true;
-      await client.setModel(model);
-      await client.setReasoning(effort);
-      marks.t_set_model = process.hrtime.bigint();
-    }
+    ({ client, release, slot } = await acquireTurn({ sessionId, cwd, clearContext, model, effort, marks }));
   } catch (err) {
-    if (slot) pool.release(slot);
     return apiError(res, 503, `ACP backend unavailable: ${err.message}`, 'api_error');
   }
 
@@ -1290,6 +1356,126 @@ app.post('/v1/chat/completions', async (req, res) => {
     if (slot) pool.release(slot);
   }
 });
+
+// ── Responses API (/v1/responses) ─────────────────────────────────────────────
+// OpenAI Responses-shaped endpoint (used by clients like Langflow). Translates the
+// `input`/`instructions` request to the ACP backend and emits a `response` object
+// (non-stream) or the standard response.* SSE event sequence (stream).
+
+async function handleResponses(req, res) {
+  const {
+    model = PROFILE.defaultModel,
+    input = [],
+    instructions,
+    stream = false,
+    tools: respTools,
+    reasoning,
+    reasoning_effort,
+    // max_output_tokens, temperature, top_p, store, metadata, … accepted-and-ignored
+  } = req.body ?? {};
+
+  const messages = responsesInputToMessages(input, instructions);
+  if (!messages.length) {
+    return apiError(res, 400, '`input` is required and must be a string or a non-empty array', 'invalid_request_error', 'input');
+  }
+
+  const tools     = responsesToolsToChat(respTools);
+  const effort    = resolveEffort(reasoning?.effort ?? reasoning_effort);
+  const blocks    = buildAcpBlocks(messages, tools, {});
+  const cwd       = req.headers['x-working-dir'] ?? pickCwd(blocks, CWD);
+  const sessionId = req.headers['x-session-id'] ?? (AUTO_SESSION_HASH ? autoSessionId(messages) : null);
+  const clearContext = /^(1|true|reset|yes)$/i.test(req.headers['x-clear-context'] ?? '');
+  const id        = `resp_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+
+  let client, release, slot;
+  const marks = { t_req_start: process.hrtime.bigint() };
+  try {
+    ({ client, release, slot } = await acquireTurn({ sessionId, cwd, clearContext, model, effort, marks }));
+  } catch (err) {
+    return apiError(res, 503, `ACP backend unavailable: ${err.message}`, 'api_error');
+  }
+
+  const timingMeta = { rid: req.id, model, mode: PROFILE.mode, tools: !!tools?.length, stream };
+  let timedOut = false;
+  const timeoutPromise = MAX_EXEC_MS > 0
+    ? new Promise((_, reject) => setTimeout(() => { timedOut = true; reject(new Error('prompt_timeout')); }, MAX_EXEC_MS))
+    : new Promise(() => {});
+
+  const tokens = (msg, text) => ({
+    pt: msg.promptTokens     || estimateTokens(blocks.map(b => b.text ?? '').join('')),
+    ct: msg.completionTokens || estimateTokens(text),
+  });
+
+  try {
+    if (stream) {
+      setSSEHeaders(res);
+      let seq = 0;
+      const ev = (type, obj) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, sequence_number: seq++, ...obj })}\n\n`);
+      const itemId = `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+      const baseResp = status => ({ id, object: 'response', created_at: nowSec(), model, status, output: [], output_text: '' });
+
+      ev('response.created', { response: baseResp('in_progress') });
+      ev('response.in_progress', { response: baseResp('in_progress') });
+      ev('response.output_item.added', { output_index: 0, item: { type: 'message', id: itemId, status: 'in_progress', role: 'assistant', content: [] } });
+      ev('response.content_part.added', { item_id: itemId, output_index: 0, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } });
+
+      const allChunks = [];
+      let disconnected = false, releaseOnClose = null;
+      req.on('close', async () => {
+        if (!res.writableEnded) { disconnected = true; await cancelWithGrace(client, 3000); releaseOnClose?.(); releaseOnClose = null; }
+      });
+
+      const streamPromise = (async () => {
+        await client.prompt(blocks, chunk => {
+          if (disconnected || timedOut) return;
+          allChunks.push(chunk);
+          if (!res.writable || tools?.length) return;
+          if (chunk.kind === 'text') ev('response.output_text.delta', { item_id: itemId, output_index: 0, content_index: 0, delta: chunk.text });
+        }, marks);
+        if (disconnected || timedOut) return;
+
+        const message = coerceToolCall(chunksToOpenAIMessage(allChunks), tools);
+        const text    = message.content ?? '';
+        if (tools?.length && text) ev('response.output_text.delta', { item_id: itemId, output_index: 0, content_index: 0, delta: text });
+        ev('response.output_text.done',   { item_id: itemId, output_index: 0, content_index: 0, text });
+        ev('response.content_part.done',  { item_id: itemId, output_index: 0, content_index: 0, part: { type: 'output_text', text, annotations: [] } });
+        ev('response.output_item.done',   { output_index: 0, item: { type: 'message', id: itemId, status: 'completed', role: 'assistant', content: [{ type: 'output_text', text, annotations: [] }] } });
+        const { pt, ct } = tokens(message, text);
+        ev('response.completed', { response: buildResponsesObject(id, model, text, message.tool_calls, pt, ct) });
+        res.end();
+      })();
+
+      releaseOnClose = release;
+      await Promise.race([streamPromise, timeoutPromise]);
+      if (!disconnected && !timedOut) recordTiming(marks, timingMeta);
+
+    } else {
+      const chunks = await Promise.race([client.prompt(blocks, undefined, marks), timeoutPromise]);
+      if (timedOut) return apiError(res, 504, 'Request timed out', 'timeout', null, 'timeout');
+
+      const message = coerceToolCall(chunksToOpenAIMessage(chunks), tools);
+      recordTiming(marks, timingMeta);
+      const { pt, ct } = tokens(message, message.content);
+      dbg('resp', `responses content=${JSON.stringify(message.content?.slice(0, 80))}`);
+      res.json(buildResponsesObject(id, model, message.content, message.tool_calls, pt, ct));
+    }
+  } catch (err) {
+    if (err.message === 'prompt_timeout' || timedOut) {
+      await cancelWithGrace(client, 3000);
+      if (!res.headersSent) return apiError(res, 504, `Request timed out after ${MAX_EXEC_MS}ms`, 'timeout', null, 'timeout');
+      if (stream && res.writable && !res.writableEnded) res.end();
+    } else {
+      log('error', err.message);
+      if (!res.headersSent) apiError(res, 500, err.message, 'api_error');
+    }
+  } finally {
+    release?.();
+    if (slot) pool.release(slot);
+  }
+}
+
+app.post('/v1/responses', handleResponses);
+app.post('/responses', handleResponses);
 
 // ── Global error handler ──────────────────────────────────────────────────────
 
