@@ -702,11 +702,13 @@ class SessionRegistry {
       this._map.delete(sessionId);
       entry = null;
     }
+    let created = false;
     if (!entry) {
       const c = new ACPSession(`reg-${sessionId.slice(0, 8)}`);
       await c.start();
       await c.initialize();
       await c.newSession(cwd);
+      created = true;
       entry = { client: c, lastUsed: Date.now(), _busy: false, _queue: [] };
       this._map.set(sessionId, entry);
     } else {
@@ -721,6 +723,7 @@ class SessionRegistry {
 
     return {
       client: entry.client,
+      created,
       release: () => {
         const next = entry._queue.shift();
         if (next) next();
@@ -1139,15 +1142,21 @@ app.post('/v1/chat/completions', async (req, res) => {
   const blocks    = buildAcpBlocks(messages, tools, { response_format, tool_choice });
   const cwd       = req.headers['x-working-dir'] ?? pickCwd(blocks, CWD);
   const sessionId = req.headers['x-session-id'] ?? (AUTO_SESSION_HASH ? autoSessionId(messages) : null);
+  // Logical-session boundary: clear conversation context on a persistent session
+  // without tearing down the warm process (codex-acp has no /clear command, so we
+  // reset by starting a fresh codex thread — session/new — on the same process).
+  const clearContext = /^(1|true|reset|yes)$/i.test(req.headers['x-clear-context'] ?? '');
   const id        = makeId();
 
-  let client, release, slot;
+  let client, release, slot, created;
   const marks = { t_req_start: process.hrtime.bigint() };
 
   try {
     if (sessionId) {
-      ({ client, release } = await registry.acquire(sessionId, cwd));
+      ({ client, release, created } = await registry.acquire(sessionId, cwd));
       marks.t_acquired = process.hrtime.bigint();
+      // Reset the thread for a new logical session (skip if just created — already fresh).
+      if (clearContext && !created) await client.newSession(cwd, marks);
       await client.setModel(model);
       await client.setReasoning(effort);
       marks.t_set_model = process.hrtime.bigint();

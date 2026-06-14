@@ -608,6 +608,47 @@ describe('POOL_PRECREATE pre-creates + recycles pool sessions', () => {
   });
 });
 
+// ─── X-Clear-Context (logical-session boundary) ───────────────────────────────
+
+describe('X-Clear-Context resets a persistent session without respawn', () => {
+  let srv;
+  before(async () => { srv = await startServer({ DEBUG: '1' }); });
+  after(async  () => await srv.kill());
+
+  async function timingFor(rid) {
+    const r = await req(srv.port, '/debug/timings');
+    const { data } = await r.json();
+    return data.find(t => t.rid === rid);
+  }
+
+  const SID = 'logical-session-1';
+
+  test('first turn creates the session', async () => {
+    const { status } = await chat(srv.port,
+      { model: 'auto', messages: [{ role: 'user', content: 'turn 1' }] },
+      { headers: { 'X-Session-Id': SID, 'X-Request-Id': 'clr-1' } });
+    assert.equal(status, 200);
+  });
+
+  test('reused turn without clear does NOT call session/new (warm thread)', async () => {
+    const { status } = await chat(srv.port,
+      { model: 'auto', messages: [{ role: 'user', content: 'turn 2' }] },
+      { headers: { 'X-Session-Id': SID, 'X-Request-Id': 'clr-2' } });
+    assert.equal(status, 200);
+    const t = await timingFor('clr-2');
+    assert.equal(t.session_new_ms, null, 'no reset → reuses warm thread');
+  });
+
+  test('X-Clear-Context resets the thread (fresh session/new on the warm process)', async () => {
+    const { status } = await chat(srv.port,
+      { model: 'auto', messages: [{ role: 'user', content: 'new logical session' }] },
+      { headers: { 'X-Session-Id': SID, 'X-Request-Id': 'clr-3', 'X-Clear-Context': '1' } });
+    assert.equal(status, 200);
+    const t = await timingFor('clr-3');
+    assert.ok(t.session_new_ms != null, 'clear → session/new ran on the warm process');
+  });
+});
+
 // ─── AUTO_SESSION_HASH ────────────────────────────────────────────────────────
 
 describe('AUTO_SESSION_HASH routing', () => {

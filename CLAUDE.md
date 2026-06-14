@@ -152,6 +152,7 @@ Both serialization styles are handled in `_route`:
 
 - **Pool (stateless)**: `session/new` called per-request on the acquired slot; slot released in `finally`. With `POOL_PRECREATE=1`, the slot pre-creates the session at warmup and recycles it in the background on release, so the request reuses a warm session for the default cwd (a custom `X-Working-Dir` still pays `session/new`); isolation is preserved because a consumed session is always re-created before reuse.
 - **Registry (stateful, `X-Session-Id`)**: per-session FIFO lock (`_busy` + `_queue`) prevents concurrent turns on the same session. On disconnect: `session/cancel` notification + 3 s grace period before releasing lock.
+- **Logical-session boundary — `X-Clear-Context: 1`** (also `reset`/`true`/`yes`): clears the conversation on a persistent `X-Session-Id` between unrelated tasks **without** respawning the process. codex-acp 0.16.0 has no `/clear` command (only `/compact`, which summarizes), so the proxy resets by starting a fresh codex thread (`session/new`) on the same warm process — clean context, no cross-task bleed, and the OpenAI system-prompt prefix cache survives. Skipped on a just-created session. Verified end-to-end: warm turn recalls a fact, the post-clear turn does not. The cleared turn pays `session/new` (~5 s) but avoids process spawn + initialize.
 - `MAX_EXEC_MS` enforced via `Promise.race([promptPromise, timeoutPromise])` → cancel + 504 on timeout.
 
 ### OpenAI compatibility
