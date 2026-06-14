@@ -698,6 +698,8 @@ describe('X-Clear-Context resets a persistent session without respawn', () => {
     assert.equal(status, 200);
     const t = await timingFor('clr-2');
     assert.equal(t.session_new_ms, null, 'no reset → reuses warm thread');
+    assert.equal(t.session, 'reuse', 'session state recorded as reuse');
+    assert.ok(t.prompt_chars > 0 && t.prompt_tokens_est > 0, 'prompt size recorded');
   });
 
   test('X-Clear-Context resets the thread (fresh session/new on the warm process)', async () => {
@@ -707,6 +709,7 @@ describe('X-Clear-Context resets a persistent session without respawn', () => {
     assert.equal(status, 200);
     const t = await timingFor('clr-3');
     assert.ok(t.session_new_ms != null, 'clear → session/new ran on the warm process');
+    assert.equal(t.session, 'cleared', 'session state recorded as cleared');
   });
 });
 

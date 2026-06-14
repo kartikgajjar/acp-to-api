@@ -308,10 +308,20 @@ function _ns2ms(a, b) {
 }
 const _timings = [];
 const _TIMINGS_MAX = 200;
-function recordTiming(marks, meta) {
+function recordTiming(marks, meta, chunks) {
   const m = marks;
+  let nText = 0, nThought = 0, replyChars = 0;
+  for (const c of chunks ?? []) {
+    if (c.kind === 'text') { nText++; replyChars += c.text?.length ?? 0; }
+    else if (c.kind === 'thought') nThought++;
+  }
   const rec = {
     rid: meta.rid, model: meta.model, tools: meta.tools, stream: meta.stream,
+    session: meta.session ?? null,
+    prompt_chars:      meta.promptChars ?? null,
+    prompt_tokens_est: meta.promptChars != null ? Math.ceil(meta.promptChars / 4) : null,
+    n_messages:        meta.nMessages ?? null,
+    n_tools:           meta.nTools ?? null,
     acquire_ms:       _ns2ms(m.t_req_start, m.t_acquired),
     session_new_ms:   _ns2ms(m.t_acquired, m.t_session_created),
     set_mode_ms:      _ns2ms(m.t_session_created, m.t_post_session),
@@ -321,13 +331,23 @@ function recordTiming(marks, meta) {
     reasoning_gap_ms: _ns2ms(m.t_first_update, m.t_first_text),
     gen_ms:           _ns2ms(m.t_first_text, m.t_complete),
     total_ms:         _ns2ms(m.t_req_start, m.t_complete),
+    reply_chars:      chunks ? replyChars : null,
+    n_text:           chunks ? nText : null,
+    n_thought:        chunks ? nThought : null,
+    n_chunks:         chunks ? chunks.length : null,
   };
   if (DEBUG) {
     _timings.push(rec);
     if (_timings.length > _TIMINGS_MAX) _timings.shift();
     dbg('timing', JSON.stringify(rec));
+    log('perf', `${rec.session ?? '-'}  in=${rec.prompt_tokens_est ?? '?'}tok/${rec.n_tools ?? 0}tools  prefill=${rec.prefill_ms ?? '?'}ms  reason=${rec.reasoning_gap_ms ?? 0}ms  gen=${rec.gen_ms ?? '?'}ms  total=${rec.total_ms ?? '?'}ms  rid=${rec.rid}`);
   }
   return rec;
+}
+
+// Total character length of the prompt blocks (drives prefill; logged for analysis).
+function promptCharLen(blocks) {
+  return blocks.reduce((n, b) => n + (b.text?.length ?? 0), 0);
 }
 
 // Derive a stable session ID from the system message content.
@@ -1156,7 +1176,7 @@ app.get('/api/ps', (_, res) => {
 
 // ── Core completion handler ───────────────────────────────────────────────────
 
-async function handleOllamaCompletion(req, res, { blocks, model, stream, wantThinking, isGenerate, tools, sessionIdOverride, effort }) {
+async function handleOllamaCompletion(req, res, { blocks, model, stream, wantThinking, isGenerate, tools, sessionIdOverride, effort, nMessages }) {
   const cwd      = req.headers['x-working-dir'] ?? pickCwd(blocks, CWD);
   const sessionId = req.headers['x-session-id'] ?? sessionIdOverride;
   // Logical-session boundary: clear context on a persistent session without respawn
@@ -1164,12 +1184,13 @@ async function handleOllamaCompletion(req, res, { blocks, model, stream, wantThi
   const clearContext = /^(1|true|reset|yes)$/i.test(req.headers['x-clear-context'] ?? '');
   const rid = req.headers['x-request-id'] || makeReqId();
 
-  let client, slot, created;
+  let client, slot, created, sessionState;
   const marks = { t_req_start: process.hrtime.bigint() };
   if (sessionId) {
     ({ client, created } = await registry.acquire(sessionId, cwd));
     marks.t_acquired = process.hrtime.bigint();
     if (clearContext && !created) await client.newSession(cwd, marks);
+    sessionState = created ? 'new' : (clearContext ? 'cleared' : 'reuse');
     await client.setModel(model);
     await client.setReasoning(effort);
     marks.t_set_model = process.hrtime.bigint();
@@ -1181,12 +1202,14 @@ async function handleOllamaCompletion(req, res, { blocks, model, stream, wantThi
     const reuse = POOL_PRECREATE && client.sessionId && !client._sessionConsumed && client.sessionCwd === cwd;
     if (!reuse) await client.newSession(cwd, marks);
     client._sessionConsumed = true;
+    sessionState = reuse ? 'reuse' : 'new';
     await client.setModel(model);
     await client.setReasoning(effort);
     marks.t_set_model = process.hrtime.bigint();
   }
 
-  const timingMeta = { rid, model, tools: !!tools?.length, stream };
+  const timingMeta = { rid, model, tools: !!tools?.length, stream,
+    session: sessionState, promptChars: promptCharLen(blocks), nMessages: nMessages ?? null, nTools: tools?.length ?? 0 };
   const startNs = marks.t_req_start;
 
   try {
@@ -1216,7 +1239,7 @@ async function handleOllamaCompletion(req, res, { blocks, model, stream, wantThi
           }
         }
       }, marks);
-      recordTiming(marks, timingMeta);
+      recordTiming(marks, timingMeta, allChunks);
 
       if (isGenerate) {
         const textChunks = allChunks.filter((c) => c.kind === 'text').map((c) => c.text).join('');
@@ -1242,7 +1265,7 @@ async function handleOllamaCompletion(req, res, { blocks, model, stream, wantThi
 
     } else {
       const chunks = await client.prompt(blocks, undefined, marks);
-      recordTiming(marks, timingMeta);
+      recordTiming(marks, timingMeta, chunks);
 
       if (isGenerate) {
         const textContent = chunks.filter((c) => c.kind === 'text').map((c) => c.text).join('');
@@ -1298,7 +1321,7 @@ app.post('/api/chat', async (req, res) => {
   dbg('chat', `tools=${JSON.stringify(tools ?? null)}  format=${JSON.stringify(format ?? null)}`);
   if (sessionIdOverride) dbg('chat', `auto-session=${sessionIdOverride}`);
 
-  await handleOllamaCompletion(req, res, { blocks, model, stream, wantThinking, isGenerate: false, tools, sessionIdOverride, effort: reasoningFrom(think) });
+  await handleOllamaCompletion(req, res, { blocks, model, stream, wantThinking, isGenerate: false, tools, sessionIdOverride, effort: reasoningFrom(think), nMessages: messages.length });
 });
 
 // ── POST /api/generate ────────────────────────────────────────────────────────
@@ -1321,7 +1344,7 @@ app.post('/api/generate', async (req, res) => {
   const wantThinking = !!think;
   const blocks       = buildAcpBlocksFromGenerate(prompt, system, images, { format, think });
 
-  await handleOllamaCompletion(req, res, { blocks, model, stream, wantThinking, isGenerate: true, effort: reasoningFrom(think) });
+  await handleOllamaCompletion(req, res, { blocks, model, stream, wantThinking, isGenerate: true, effort: reasoningFrom(think), nMessages: 1 });
 });
 
 // ── Embeddings ────────────────────────────────────────────────────────────────

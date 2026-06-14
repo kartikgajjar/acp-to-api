@@ -273,14 +273,25 @@ function _ns2ms(a, b) {
 const _timings = [];           // ring buffer of recent splits (DEBUG only)
 const _TIMINGS_MAX = 200;
 
-function recordTiming(marks, meta) {
+function recordTiming(marks, meta, chunks) {
   const m = marks;
+  // Reply-side stats from the collected chunks (explains gen_ms / output size).
+  let nText = 0, nThought = 0, replyChars = 0;
+  for (const c of chunks ?? []) {
+    if (c.kind === 'text') { nText++; replyChars += c.text?.length ?? 0; }
+    else if (c.kind === 'thought') nThought++;
+  }
   const rec = {
     rid:    meta.rid,
     model:  meta.model,
     mode:   meta.mode,
     tools:  meta.tools,
     stream: meta.stream,
+    session: meta.session ?? null,                                  // new | reuse | cleared
+    prompt_chars:      meta.promptChars ?? null,                    // drives prefill_ms
+    prompt_tokens_est: meta.promptChars != null ? Math.ceil(meta.promptChars / 4) : null,
+    n_messages:        meta.nMessages ?? null,
+    n_tools:           meta.nTools ?? null,
     acquire_ms:       _ns2ms(m.t_req_start, m.t_acquired),
     session_new_ms:   _ns2ms(m.t_acquired, m.t_session_created),
     set_mode_ms:      _ns2ms(m.t_session_created, m.t_post_session),
@@ -290,11 +301,17 @@ function recordTiming(marks, meta) {
     reasoning_gap_ms: _ns2ms(m.t_first_update, m.t_first_text),
     gen_ms:           _ns2ms(m.t_first_text, m.t_complete),
     total_ms:         _ns2ms(m.t_req_start, m.t_complete),
+    reply_chars:      chunks ? replyChars : null,
+    n_text:           chunks ? nText : null,
+    n_thought:        chunks ? nThought : null,
+    n_chunks:         chunks ? chunks.length : null,
   };
   if (DEBUG) {
     _timings.push(rec);
     if (_timings.length > _TIMINGS_MAX) _timings.shift();
     dbg('timing', JSON.stringify(rec));
+    // One-line summary so the bottleneck is obvious without parsing JSON.
+    log('perf', `${rec.session ?? '-'}  in=${rec.prompt_tokens_est ?? '?'}tok/${rec.n_tools ?? 0}tools  prefill=${rec.prefill_ms ?? '?'}ms  reason=${rec.reasoning_gap_ms ?? 0}ms  gen=${rec.gen_ms ?? '?'}ms  total=${rec.total_ms ?? '?'}ms  rid=${rec.rid}`);
   }
   return rec;
 }
@@ -1052,7 +1069,7 @@ if (DEBUG) {
     // Log full request body to file for offline analysis
     if (_logStream && req.body) {
       const bodyStr = JSON.stringify(req.body);
-      _fileLine(`${ts()} [HTTP→] ${req.method} ${req.path}  rid=${req.id}  body=${bodyStr.length > 4000 ? bodyStr.slice(0, 4000) + '…' : bodyStr}`);
+      _fileLine(`${ts()} [HTTP→] ${req.method} ${req.path}  rid=${req.id}  bytes=${bodyStr.length}  body=${bodyStr.length > 4000 ? bodyStr.slice(0, 4000) + '…' : bodyStr}`);
     }
     res.on('finish', () => {
       const model = req.body?.model ?? '-';
@@ -1119,13 +1136,14 @@ app.get('/models', modelsHandler);
 // applying clear-context reset, model, and reasoning, and stamping timing marks.
 // Throws on failure (releasing any pool slot first); callers map that to a 503.
 async function acquireTurn({ sessionId, cwd, clearContext, model, effort, marks }) {
-  let client, release, slot, created;
+  let client, release, slot, created, sessionState;
   try {
     if (sessionId) {
       ({ client, release, created } = await registry.acquire(sessionId, cwd));
       marks.t_acquired = process.hrtime.bigint();
       // Reset the thread for a new logical session (skip if just created — already fresh).
       if (clearContext && !created) await client.newSession(cwd, marks);
+      sessionState = created ? 'new' : (clearContext ? 'cleared' : 'reuse');
     } else {
       slot   = await pool.acquire();
       client = slot.client;
@@ -1133,6 +1151,7 @@ async function acquireTurn({ sessionId, cwd, clearContext, model, effort, marks 
       const reuse = POOL_PRECREATE && client.sessionId && !client._sessionConsumed && client.sessionCwd === cwd;
       if (!reuse) await client.newSession(cwd, marks);
       client._sessionConsumed = true;
+      sessionState = reuse ? 'reuse' : 'new';
     }
     await client.setModel(model);
     await client.setReasoning(effort);
@@ -1141,7 +1160,12 @@ async function acquireTurn({ sessionId, cwd, clearContext, model, effort, marks 
     if (slot) pool.release(slot);
     throw err;
   }
-  return { client, release, slot };
+  return { client, release, slot, sessionState };
+}
+
+// Total character length of the prompt blocks (drives prefill; logged for analysis).
+function promptCharLen(blocks) {
+  return blocks.reduce((n, b) => n + (b.text?.length ?? 0), 0);
 }
 
 // Resolve an effort from a request value, falling back to the server default.
@@ -1235,16 +1259,17 @@ app.post('/v1/chat/completions', async (req, res) => {
   const clearContext = /^(1|true|reset|yes)$/i.test(req.headers['x-clear-context'] ?? '');
   const id        = makeId();
 
-  let client, release, slot;
+  let client, release, slot, sessionState;
   const marks = { t_req_start: process.hrtime.bigint() };
 
   try {
-    ({ client, release, slot } = await acquireTurn({ sessionId, cwd, clearContext, model, effort, marks }));
+    ({ client, release, slot, sessionState } = await acquireTurn({ sessionId, cwd, clearContext, model, effort, marks }));
   } catch (err) {
     return apiError(res, 503, `ACP backend unavailable: ${err.message}`, 'api_error');
   }
 
-  const timingMeta = { rid: req.id, model, mode: PROFILE.mode, tools: !!tools?.length, stream };
+  const timingMeta = { rid: req.id, model, mode: PROFILE.mode, tools: !!tools?.length, stream,
+    session: sessionState, promptChars: promptCharLen(blocks), nMessages: messages.length, nTools: tools?.length ?? 0 };
 
   // Timeout race
   let timedOut = false;
@@ -1317,7 +1342,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       await Promise.race([streamPromise, timeoutPromise]);
 
-      if (!disconnected && !timedOut) recordTiming(marks, timingMeta);
+      if (!disconnected && !timedOut) recordTiming(marks, timingMeta, allChunks);
 
     } else {
       const promptPromise = client.prompt(blocks, undefined, marks);
@@ -1330,7 +1355,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       const raw     = chunksToOpenAIMessage(chunks);
       const message = coerceToolCall(raw, tools);
 
-      const timing           = recordTiming(marks, timingMeta);
+      const timing           = recordTiming(marks, timingMeta, chunks);
       const elapsed          = timing.total_ms ?? Number(process.hrtime.bigint() - marks.t_req_start) / 1e6;
       const promptTxt        = blocks.map(b => b.text ?? '').join('');
       const promptTokens     = message.promptTokens     || estimateTokens(promptTxt);
@@ -1387,15 +1412,16 @@ async function handleResponses(req, res) {
   const clearContext = /^(1|true|reset|yes)$/i.test(req.headers['x-clear-context'] ?? '');
   const id        = `resp_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
 
-  let client, release, slot;
+  let client, release, slot, sessionState;
   const marks = { t_req_start: process.hrtime.bigint() };
   try {
-    ({ client, release, slot } = await acquireTurn({ sessionId, cwd, clearContext, model, effort, marks }));
+    ({ client, release, slot, sessionState } = await acquireTurn({ sessionId, cwd, clearContext, model, effort, marks }));
   } catch (err) {
     return apiError(res, 503, `ACP backend unavailable: ${err.message}`, 'api_error');
   }
 
-  const timingMeta = { rid: req.id, model, mode: PROFILE.mode, tools: !!tools?.length, stream };
+  const timingMeta = { rid: req.id, model, mode: PROFILE.mode, tools: !!tools?.length, stream,
+    session: sessionState, promptChars: promptCharLen(blocks), nMessages: messages.length, nTools: tools?.length ?? 0 };
   let timedOut = false;
   const timeoutPromise = MAX_EXEC_MS > 0
     ? new Promise((_, reject) => setTimeout(() => { timedOut = true; reject(new Error('prompt_timeout')); }, MAX_EXEC_MS))
@@ -1447,14 +1473,14 @@ async function handleResponses(req, res) {
 
       releaseOnClose = release;
       await Promise.race([streamPromise, timeoutPromise]);
-      if (!disconnected && !timedOut) recordTiming(marks, timingMeta);
+      if (!disconnected && !timedOut) recordTiming(marks, timingMeta, allChunks);
 
     } else {
       const chunks = await Promise.race([client.prompt(blocks, undefined, marks), timeoutPromise]);
       if (timedOut) return apiError(res, 504, 'Request timed out', 'timeout', null, 'timeout');
 
       const message = coerceToolCall(chunksToOpenAIMessage(chunks), tools);
-      recordTiming(marks, timingMeta);
+      recordTiming(marks, timingMeta, chunks);
       const { pt, ct } = tokens(message, message.content);
       dbg('resp', `responses content=${JSON.stringify(message.content?.slice(0, 80))}`);
       res.json(buildResponsesObject(id, model, message.content, message.tool_calls, pt, ct));
