@@ -34,6 +34,7 @@ const ALLOW_INSECURE   = process.env.ALLOW_INSECURE_REMOTE     === '1';
 const CWD              = process.env.ACP_CWD ?? process.env.KIRO_CWD ?? process.env.CODEX_CWD ?? process.cwd();
 const DEBUG            = process.env.DEBUG                     === '1';
 const POOL_SIZE        = parseInt(process.env.POOL_SIZE        ?? '4');
+const POOL_PRECREATE   = process.env.POOL_PRECREATE           === '1';
 const SESSION_TTL_MS   = parseInt(process.env.SESSION_TTL_MS   ?? String(30 * 60 * 1000));
 const PING_INTERVAL_MS = parseInt(process.env.PING_INTERVAL    ?? '60000');
 const MAX_EXEC_MS      = parseInt(process.env.MAX_EXEC_MS      ?? String(10 * 60 * 1000));
@@ -68,6 +69,7 @@ const BACKENDS = {
       await session._reqSafe('model', 'session/set_model', { sessionId: session.sessionId, modelId });
       session.currentModel = modelId;
     },
+    async setReasoning() {},
     updateMethods: new Set(['session/update', 'session/notification', '_kiro.dev/session/update']),
     parseUpdate(params) {
       const u = params.update ?? params ?? {};
@@ -118,7 +120,8 @@ const BACKENDS = {
     defaultModel: env.CODEX_MODEL_DEFAULT ?? 'gpt-5.5',
     fallbackModels: (env.CODEX_AVAILABLE_MODELS ?? 'gpt-5.5,gpt-5.4,gpt-5.4-mini').split(',').map(s => s.trim()).filter(Boolean),
     buildEnv(parent) {
-      if (!parent.OPENAI_API_KEY) throw new Error('codex backend requires OPENAI_API_KEY');
+      // codex-acp authenticates via codex's own login over ACP; OPENAI_API_KEY is
+      // optional and passed through only when present (API-key auth). Not required.
       return { ...parent };
     },
     formatStartupModels(ids) { return [...new Set(ids)]; },
@@ -130,6 +133,10 @@ const BACKENDS = {
       if (!modelId || modelId === 'auto' || modelId === session.currentModel) return;
       await session._reqSafe('model', 'session/set_config_option', { sessionId: session.sessionId, configId: 'model', value: modelId });
       session.currentModel = modelId;
+    },
+    async setReasoning(session, effort) {
+      if (!effort) return;
+      await session._reqSafe('reasoning', 'session/set_config_option', { sessionId: session.sessionId, configId: 'reasoning_effort', value: effort });
     },
     updateMethods: new Set(['session/update', 'session/notification']),
     parseUpdate(params) {
@@ -242,6 +249,56 @@ function makeToolCallId() { return `call_${randomUUID().replace(/-/g, '').slice(
 function makeReqId()      { return `req_${randomUUID().replace(/-/g, '').slice(0, 24)}`; }
 function nowSec()         { return Math.floor(Date.now() / 1000); }
 
+// OpenAI reasoning_effort values that pass through to the backend (codex maps these
+// to ReasoningEffort; 'none'/'xhigh' are codex extensions accepted if a client sends them).
+const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
+
+// Server-side default reasoning effort applied when a request omits reasoning_effort.
+// Defaults to 'low' for low TTFT — the reasoning pass is the dominant first-token cost
+// on codex reasoning models, and 'low' is the lowest effort the codex-acp 0.16.0 default
+// preset accepts ('minimal'/'none' are rejected per the capability probe). Set
+// CODEX_REASONING_EFFORT= (empty) to disable, or a higher tier to trade latency for depth.
+// Invalid/unsupported values no-op via _reqSafe. kiro ignores it.
+const _reasoningDefaultEnv = process.env.CODEX_REASONING_EFFORT ?? 'low';
+const REASONING_DEFAULT = REASONING_EFFORTS.has(_reasoningDefaultEnv) ? _reasoningDefaultEnv : null;
+
+// ─── Latency instrumentation (Phase 0) ────────────────────────────────────────
+// Threaded `marks` objects collect process.hrtime.bigint() stamps across the
+// request lifecycle; recordTiming() turns them into a machine-readable split.
+
+function _ns2ms(a, b) {
+  return a != null && b != null ? Number((Number(b - a) / 1e6).toFixed(1)) : null;
+}
+
+const _timings = [];           // ring buffer of recent splits (DEBUG only)
+const _TIMINGS_MAX = 200;
+
+function recordTiming(marks, meta) {
+  const m = marks;
+  const rec = {
+    rid:    meta.rid,
+    model:  meta.model,
+    mode:   meta.mode,
+    tools:  meta.tools,
+    stream: meta.stream,
+    acquire_ms:       _ns2ms(m.t_req_start, m.t_acquired),
+    session_new_ms:   _ns2ms(m.t_acquired, m.t_session_created),
+    set_mode_ms:      _ns2ms(m.t_session_created, m.t_post_session),
+    set_model_ms:     _ns2ms(m.t_post_session ?? m.t_acquired, m.t_set_model),
+    prefill_ms:       _ns2ms(m.t_prompt_sent, m.t_first_update),
+    thought_gap_ms:   _ns2ms(m.t_first_update, m.t_first_thought),
+    reasoning_gap_ms: _ns2ms(m.t_first_update, m.t_first_text),
+    gen_ms:           _ns2ms(m.t_first_text, m.t_complete),
+    total_ms:         _ns2ms(m.t_req_start, m.t_complete),
+  };
+  if (DEBUG) {
+    _timings.push(rec);
+    if (_timings.length > _TIMINGS_MAX) _timings.shift();
+    dbg('timing', JSON.stringify(rec));
+  }
+  return rec;
+}
+
 function autoSessionId(messages) {
   const sys = messages?.find?.(m => m.role === 'system');
   const key = sys ? contentText(sys.content) : '__no_system__';
@@ -349,6 +406,8 @@ class ACPSession extends EventEmitter {
     this._msgId     = 0;
     this._pending   = new Map();
     this.sessionId  = null;
+    this.sessionCwd = null;          // cwd the active session was created with (pool reuse)
+    this._sessionConsumed = false;   // true once a stateless turn has used this session
     this._pingTimer = null;
     this._dead      = false;
   }
@@ -484,13 +543,17 @@ class ACPSession extends EventEmitter {
     this._startPing();
   }
 
-  async newSession(cwd = CWD) {
+  async newSession(cwd = CWD, timings) {
     const result = await this._req('session/new', { cwd, mcpServers: [] });
+    if (timings) timings.t_session_created = process.hrtime.bigint();
+    this.sessionCwd       = cwd;
+    this._sessionConsumed = false;
     this.sessionId       = result?.sessionId ?? result?.id;
     this.availableModels = result?.models?.availableModels?.map(m => m.modelId) ?? [];
     this.currentModel    = result?.models?.currentModelId ?? 'auto';
     // Backend-specific post-session setup (e.g. codex session/set_mode full-access)
     await PROFILE.postNewSession(this);
+    if (timings) timings.t_post_session = process.hrtime.bigint();
     return this.sessionId;
   }
 
@@ -498,11 +561,25 @@ class ACPSession extends EventEmitter {
     return PROFILE.setModel(this, modelId);
   }
 
-  async prompt(blocks, onChunk) {
+  async setReasoning(effort) {
+    return PROFILE.setReasoning(this, effort);
+  }
+
+  async prompt(blocks, onChunk, timings) {
     const chunks = [];
-    const handler = c => { chunks.push(c); onChunk?.(c); };
+    const handler = c => {
+      if (timings) {
+        const now = process.hrtime.bigint();
+        if (timings.t_first_update  == null) timings.t_first_update  = now;
+        if (c.kind === 'thought' && timings.t_first_thought == null) timings.t_first_thought = now;
+        if (c.kind === 'text'    && timings.t_first_text    == null) timings.t_first_text    = now;
+      }
+      chunks.push(c);
+      onChunk?.(c);
+    };
     this.on('chunk', handler);
     dbg(`prompt:${this.label}`, `streaming…`);
+    if (timings) timings.t_prompt_sent = process.hrtime.bigint();
     try {
       await this._req('session/prompt', {
         sessionId: this.sessionId,
@@ -512,6 +589,7 @@ class ACPSession extends EventEmitter {
     } finally {
       this.off('chunk', handler);
     }
+    if (timings) timings.t_complete = process.hrtime.bigint();
     dbg(`prompt:${this.label}`, `done  chunks=${chunks.length}`);
     return chunks;
   }
@@ -557,6 +635,9 @@ class ACPPool {
       const c = new ACPSession(`pool-${this._slots.indexOf(slot)}`);
       await c.start();
       await c.initialize();
+      // POOL_PRECREATE: pre-pay session/new + set_mode at warmup so stateless
+      // requests can skip it on their critical path (recycled on release).
+      if (POOL_PRECREATE) await c.newSession(CWD);
       c.once('dead', () => { slot.client = null; });
       slot.client = c;
     } catch (e) { log('pool', `slot init failed: ${e.message}`); slot.client = null; }
@@ -564,7 +645,13 @@ class ACPPool {
 
   async acquire() {
     const free = this._slots.find(s => !s.busy);
-    if (free) { free.busy = true; if (!free.client?.alive) await this._initSlot(free); return free; }
+    if (free) {
+      free.busy = true;
+      // Wait for any in-flight background recycle so the handler sees a settled session.
+      if (free._recycle) { try { await free._recycle; } catch {} }
+      if (!free.client?.alive) await this._initSlot(free);
+      return free;
+    }
     return new Promise(resolve => this._queue.push(resolve));
   }
 
@@ -575,6 +662,15 @@ class ACPPool {
       slot.busy = true;
       if (!slot.client?.alive) this._initSlot(slot).then(() => next(slot));
       else next(slot);
+      return;
+    }
+    // No waiter: if the slot's session was consumed by a stateless turn, recycle it
+    // in the background (fresh session/new) so the next acquirer gets an isolated,
+    // already-warm session. The handler still re-creates inline if it grabs it first.
+    if (POOL_PRECREATE && slot.client?.alive && slot.client._sessionConsumed) {
+      slot._recycle = slot.client.newSession(CWD)
+        .catch(e => log('pool', `recycle failed: ${e.message}`))
+        .finally(() => { slot._recycle = null; });
     }
   }
 
@@ -968,6 +1064,7 @@ if (DEBUG) {
 // Auth + IP allowlist — /health and / are always open
 app.use((req, res, next) => {
   if (req.path === '/' || req.path === '/health') return next();
+  if (DEBUG && req.path === '/debug/timings') return next();
 
   if (ALLOWED_IPS.length > 0) {
     const ip = (req.headers['x-forwarded-for']?.split(',')[0] ?? req.socket.remoteAddress ?? '').replace('::ffff:', '');
@@ -990,6 +1087,13 @@ app.get('/', (_, res) => res.json({ object: 'codex-acp-proxy', version: '1.0.0' 
 app.get('/health', (_, res) => {
   res.json({ status: 'ok', pool: pool.stats, registry: registry.stats });
 });
+
+// Latency split ring buffer (Phase 0) — DEBUG only, unauthenticated like /health
+if (DEBUG) {
+  app.get('/debug/timings', (_, res) => {
+    res.json({ object: 'list', count: _timings.length, data: _timings });
+  });
+}
 
 // ── Models ────────────────────────────────────────────────────────────────────
 
@@ -1015,10 +1119,17 @@ app.post('/v1/chat/completions', async (req, res) => {
     tools,
     tool_choice,
     response_format,
+    reasoning_effort,
     // Accepted and silently ignored (off-the-shelf clients don't 400):
     // temperature, max_tokens, top_p, seed, stop, n, logprobs,
-    // parallel_tool_calls, stream_options, reasoning_effort, user, service_tier
+    // parallel_tool_calls, stream_options, user, service_tier
   } = req.body ?? {};
+
+  // Map OpenAI reasoning_effort onto the backend's reasoning config. Codex accepts
+  // none|minimal|low|medium|high|xhigh; the backend validates against the model
+  // preset and a _reqSafe no-ops if unsupported. A request value wins; otherwise the
+  // server default (REASONING_DEFAULT) applies. Unknown request values fall back too.
+  const effort = (REASONING_EFFORTS.has(reasoning_effort) ? reasoning_effort : null) ?? REASONING_DEFAULT;
 
   if (!Array.isArray(messages) || !messages.length) {
     return apiError(res, 400, '`messages` is required and must be a non-empty array',
@@ -1031,23 +1142,34 @@ app.post('/v1/chat/completions', async (req, res) => {
   const id        = makeId();
 
   let client, release, slot;
+  const marks = { t_req_start: process.hrtime.bigint() };
 
   try {
     if (sessionId) {
       ({ client, release } = await registry.acquire(sessionId, cwd));
+      marks.t_acquired = process.hrtime.bigint();
       await client.setModel(model);
+      await client.setReasoning(effort);
+      marks.t_set_model = process.hrtime.bigint();
     } else {
       slot   = await pool.acquire();
       client = slot.client;
-      await client.newSession(cwd);
+      marks.t_acquired = process.hrtime.bigint();
+      // Reuse a pre-created, unconsumed session for the same cwd (POOL_PRECREATE);
+      // otherwise create one now. Either way the turn consumes it (recycled on release).
+      const reuse = POOL_PRECREATE && client.sessionId && !client._sessionConsumed && client.sessionCwd === cwd;
+      if (!reuse) await client.newSession(cwd, marks);
+      client._sessionConsumed = true;
       await client.setModel(model);
+      await client.setReasoning(effort);
+      marks.t_set_model = process.hrtime.bigint();
     }
   } catch (err) {
     if (slot) pool.release(slot);
     return apiError(res, 503, `ACP backend unavailable: ${err.message}`, 'api_error');
   }
 
-  const startNs = process.hrtime.bigint();
+  const timingMeta = { rid: req.id, model, mode: PROFILE.mode, tools: !!tools?.length, stream };
 
   // Timeout race
   let timedOut = false;
@@ -1085,7 +1207,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           if (chunk.kind === 'text') {
             res.write(sseData(makeDeltaChunk(id, model, { content: chunk.text })));
           }
-        });
+        }, marks);
 
         if (disconnected || timedOut) return;
 
@@ -1120,8 +1242,10 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       await Promise.race([streamPromise, timeoutPromise]);
 
+      if (!disconnected && !timedOut) recordTiming(marks, timingMeta);
+
     } else {
-      const promptPromise = client.prompt(blocks);
+      const promptPromise = client.prompt(blocks, undefined, marks);
       const chunks        = await Promise.race([promptPromise, timeoutPromise]);
 
       if (timedOut) {
@@ -1131,7 +1255,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       const raw     = chunksToOpenAIMessage(chunks);
       const message = coerceToolCall(raw, tools);
 
-      const elapsed          = Number(process.hrtime.bigint() - startNs) / 1e6;
+      const timing           = recordTiming(marks, timingMeta);
+      const elapsed          = timing.total_ms ?? Number(process.hrtime.bigint() - marks.t_req_start) / 1e6;
       const promptTxt        = blocks.map(b => b.text ?? '').join('');
       const promptTokens     = message.promptTokens     || estimateTokens(promptTxt);
       const completionTokens = message.completionTokens || estimateTokens(message.content);

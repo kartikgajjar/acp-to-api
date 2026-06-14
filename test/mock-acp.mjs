@@ -28,7 +28,7 @@ let currentSessionId = null;
 let pendingPromptId = null;
 
 // Protocol observations — what the server profile drove this backend with.
-const seen = { initialized: false, setMode: false, modelMethod: null, modelValue: null };
+const seen = { initialized: false, setMode: false, modelMethod: null, modelValue: null, reasoning: null };
 
 const rl = readline.createInterface({ input: process.stdin, terminal: false });
 
@@ -113,8 +113,12 @@ rl.on('line', line => {
       break;
 
     case 'session/set_config_option':
-      seen.modelMethod = 'set_config_option';
-      seen.modelValue = msg.params?.value ?? null;
+      if (msg.params?.configId === 'reasoning_effort') {
+        seen.reasoning = msg.params?.value ?? null;
+      } else {
+        seen.modelMethod = 'set_config_option';
+        seen.modelValue = msg.params?.value ?? null;
+      }
       ok(id);
       break;
 

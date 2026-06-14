@@ -167,6 +167,61 @@ for (const server of ['ollama', 'openai']) {
   }
 }
 
+// ─── reasoning_effort maps onto the backend's reasoning config (codex only) ─────
+
+describe('reasoning_effort forwarding', () => {
+  // CODEX_REASONING_EFFORT: '' disables the server default so these isolate per-request behavior.
+  const isolate = { MOCK_SCENARIO: 'PROTOCOL', CODEX_REASONING_EFFORT: '' };
+
+  test('codex backend forwards reasoning_effort via session/set_config_option', async () => {
+    const srv = await startServer({ server: 'openai', backend: 'codex', env: isolate });
+    try {
+      const { json } = await postJson(srv.port, '/v1/chat/completions', {
+        model: 'o4-mini', reasoning_effort: 'minimal', stream: false,
+        messages: [{ role: 'user', content: 'hi' }],
+      });
+      const seen = JSON.parse(json?.choices?.[0]?.message?.content ?? '{}');
+      assert.equal(seen.reasoning, 'minimal', 'reasoning_effort forwarded');
+      assert.equal(seen.modelValue, 'o4-mini', 'model value not clobbered by reasoning config');
+    } finally { await srv.kill(); }
+  });
+
+  test('kiro backend ignores reasoning_effort (no reasoning config sent)', async () => {
+    const srv = await startServer({ server: 'openai', backend: 'kiro', env: isolate });
+    try {
+      const { json } = await postJson(srv.port, '/v1/chat/completions', {
+        model: 'o4-mini', reasoning_effort: 'minimal', stream: false,
+        messages: [{ role: 'user', content: 'hi' }],
+      });
+      const seen = JSON.parse(json?.choices?.[0]?.message?.content ?? '{}');
+      assert.equal(seen.reasoning, null, 'kiro setReasoning is a no-op');
+    } finally { await srv.kill(); }
+  });
+
+  test('unknown reasoning_effort value is dropped (no server default → null)', async () => {
+    const srv = await startServer({ server: 'openai', backend: 'codex', env: isolate });
+    try {
+      const { json } = await postJson(srv.port, '/v1/chat/completions', {
+        model: 'o4-mini', reasoning_effort: 'bogus', stream: false,
+        messages: [{ role: 'user', content: 'hi' }],
+      });
+      const seen = JSON.parse(json?.choices?.[0]?.message?.content ?? '{}');
+      assert.equal(seen.reasoning, null, 'invalid effort never reaches the backend');
+    } finally { await srv.kill(); }
+  });
+
+  test('server default CODEX_REASONING_EFFORT applies when request omits it', async () => {
+    const srv = await startServer({ server: 'openai', backend: 'codex', env: { MOCK_SCENARIO: 'PROTOCOL', CODEX_REASONING_EFFORT: 'low' } });
+    try {
+      const { json } = await postJson(srv.port, '/v1/chat/completions', {
+        model: 'o4-mini', stream: false, messages: [{ role: 'user', content: 'hi' }],
+      });
+      const seen = JSON.parse(json?.choices?.[0]?.message?.content ?? '{}');
+      assert.equal(seen.reasoning, 'low', 'server default reasoning effort applied');
+    } finally { await srv.kill(); }
+  });
+});
+
 // ─── Tool-arg format tracks the INTERFACE, not the backend ─────────────────────
 
 describe('tool-call argument format is interface-determined', () => {
@@ -197,10 +252,10 @@ describe('tool-call argument format is interface-determined', () => {
   });
 });
 
-// ─── OPENAI_API_KEY is a backend (codex) requirement, on either interface ──────
+// ─── OPENAI_API_KEY is optional — codex-acp self-authenticates over ACP ────────
 
-describe('OPENAI_API_KEY is required only by the codex backend', () => {
-  test('openai + kiro starts with no OPENAI_API_KEY (key is backend-scoped)', async () => {
+describe('OPENAI_API_KEY is optional for the codex backend', () => {
+  test('openai + kiro starts with no OPENAI_API_KEY', async () => {
     const srv = await startServer({ server: 'openai', backend: 'kiro', env: { OPENAI_API_KEY: '' } });
     try {
       const r = await fetch(`http://127.0.0.1:${srv.port}/health`);
@@ -209,12 +264,12 @@ describe('OPENAI_API_KEY is required only by the codex backend', () => {
     } finally { await srv.kill(); }
   });
 
-  test('ollama + codex with no OPENAI_API_KEY → backend cannot spawn (pool degraded)', async () => {
-    const srv = await startServer({ server: 'ollama', backend: 'codex', env: { OPENAI_API_KEY: '' } });
+  test('openai + codex spawns with no OPENAI_API_KEY (codex-acp uses its own login)', async () => {
+    const srv = await startServer({ server: 'openai', backend: 'codex', env: { OPENAI_API_KEY: '' } });
     try {
       const r = await fetch(`http://127.0.0.1:${srv.port}/health`);
       const h = await r.json();
-      assert.equal(h.pool.alive, 0, 'codex pool must be empty without OPENAI_API_KEY');
+      assert.ok(h.pool.alive >= 1, 'codex pool should spawn without OPENAI_API_KEY (no hard requirement)');
     } finally { await srv.kill(); }
   });
 });

@@ -571,6 +571,43 @@ describe('Session management', () => {
   });
 });
 
+// ─── POOL_PRECREATE (1.3) ─────────────────────────────────────────────────────
+
+describe('POOL_PRECREATE pre-creates + recycles pool sessions', () => {
+  let srv;
+  before(async () => { srv = await startServer({ POOL_PRECREATE: '1', DEBUG: '1', POOL_SIZE: '1' }); });
+  after(async  () => await srv.kill());
+
+  async function timingFor(rid) {
+    const r = await req(srv.port, '/debug/timings');
+    const { data } = await r.json();
+    return data.find(t => t.rid === rid);
+  }
+
+  test('default-cwd request skips session/new on the critical path', async () => {
+    const { status } = await chat(srv.port,
+      { model: 'auto', messages: [{ role: 'user', content: 'Hi' }] },
+      { headers: { 'X-Request-Id': 'precreate-1' } },
+    );
+    assert.equal(status, 200);
+    const t = await timingFor('precreate-1');
+    assert.ok(t, 'timing record present');
+    assert.equal(t.session_new_ms, null, 'newSession was skipped (pre-created session reused)');
+    assert.equal(t.set_mode_ms, null, 'set_mode skipped too');
+  });
+
+  test('a second request still works (session recycled after release)', async () => {
+    const { status, body } = await chat(srv.port,
+      { model: 'auto', messages: [{ role: 'user', content: 'Again' }] },
+      { headers: { 'X-Request-Id': 'precreate-2' } },
+    );
+    assert.equal(status, 200);
+    assert.ok(body?.choices?.[0]?.message, 'got a completion');
+    const t = await timingFor('precreate-2');
+    assert.equal(t.session_new_ms, null, 'recycled session reused, still no critical-path session/new');
+  });
+});
+
 // ─── AUTO_SESSION_HASH ────────────────────────────────────────────────────────
 
 describe('AUTO_SESSION_HASH routing', () => {

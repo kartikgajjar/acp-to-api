@@ -111,6 +111,7 @@ const BACKENDS = {
       await session._reqSafe('model', 'session/set_model', { sessionId: session.sessionId, modelId });
       session.currentModel = modelId;
     },
+    async setReasoning() {},
     updateMethods: new Set(['session/update', 'session/notification', '_kiro.dev/session/update']),
     parseUpdate(params) {
       const u = params.update ?? params ?? {};
@@ -161,7 +162,8 @@ const BACKENDS = {
     defaultModel: env.CODEX_MODEL_DEFAULT ?? 'gpt-5.5',
     fallbackModels: (env.CODEX_AVAILABLE_MODELS ?? 'gpt-5.5,gpt-5.4,gpt-5.4-mini').split(',').map(s => s.trim()).filter(Boolean),
     buildEnv(parent) {
-      if (!parent.OPENAI_API_KEY) throw new Error('codex backend requires OPENAI_API_KEY');
+      // codex-acp authenticates via codex's own login over ACP; OPENAI_API_KEY is
+      // optional and passed through only when present (API-key auth). Not required.
       return { ...parent };
     },
     formatStartupModels(ids) { return [...new Set(ids)]; },
@@ -173,6 +175,10 @@ const BACKENDS = {
       if (!modelId || modelId === 'auto' || modelId === session.currentModel) return;
       await session._reqSafe('model', 'session/set_config_option', { sessionId: session.sessionId, configId: 'model', value: modelId });
       session.currentModel = modelId;
+    },
+    async setReasoning(session, effort) {
+      if (!effort) return;
+      await session._reqSafe('reasoning', 'session/set_config_option', { sessionId: session.sessionId, configId: 'reasoning_effort', value: effort });
     },
     updateMethods: new Set(['session/update', 'session/notification']),
     parseUpdate(params) {
