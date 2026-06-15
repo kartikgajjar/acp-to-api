@@ -28,19 +28,36 @@ let currentSessionId = null;
 let pendingPromptId = null;
 
 // Protocol observations — what the server profile drove this backend with.
-const seen = { initialized: false, setMode: false, modelMethod: null, modelValue: null, reasoning: null };
+const seen = {
+  initialized: false,
+  setMode: false,
+  modelMethod: null,
+  modelValue: null,
+  reasoning: null,
+};
 
 const rl = readline.createInterface({ input: process.stdin, terminal: false });
 
-function write(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
-function ok(id, result = {}) { write({ jsonrpc: '2.0', id, result }); }
-function rpcError(id, code, message) { write({ jsonrpc: '2.0', id, error: { code, message } }); }
-function notify(method, params) { write({ jsonrpc: '2.0', method, params }); }
+function write(obj) {
+  process.stdout.write(JSON.stringify(obj) + '\n');
+}
+function ok(id, result = {}) {
+  write({ jsonrpc: '2.0', id, result });
+}
+function rpcError(id, code, message) {
+  write({ jsonrpc: '2.0', id, error: { code, message } });
+}
+function notify(method, params) {
+  write({ jsonrpc: '2.0', method, params });
+}
 
 async function handlePrompt(id) {
   if (SCENARIO === 'CRASH') process.exit(1);
-  if (SCENARIO === 'TIMEOUT') { pendingPromptId = id; return; }
-  if (SCENARIO === 'SLOW') await new Promise(r => setTimeout(r, 300));
+  if (SCENARIO === 'TIMEOUT') {
+    pendingPromptId = id;
+    return;
+  }
+  if (SCENARIO === 'SLOW') await new Promise((r) => setTimeout(r, 300));
 
   if (SCENARIO === 'PROTOCOL') {
     notify('session/update', {
@@ -48,33 +65,57 @@ async function handlePrompt(id) {
       update: { type: 'AgentMessageChunk', content: { text: JSON.stringify(seen) } },
     });
   } else if (SCENARIO === 'TOOL_CALL') {
-    const toolJson = JSON.stringify({ tool_call: { name: 'get_weather', arguments: { location: 'San Francisco' } } });
-    notify('session/update', { sessionId: currentSessionId, update: { type: 'AgentMessageChunk', content: { text: toolJson } } });
+    const toolJson = JSON.stringify({
+      tool_call: { name: 'get_weather', arguments: { location: 'San Francisco' } },
+    });
+    notify('session/update', {
+      sessionId: currentSessionId,
+      update: { type: 'AgentMessageChunk', content: { text: toolJson } },
+    });
   } else if (SCENARIO === 'USAGE') {
-    notify('session/update', { sessionId: currentSessionId, update: { type: 'AgentMessageChunk', content: { text: 'Usage test response' } } });
-    notify('session/update', { sessionId: currentSessionId, update: { type: 'UsageUpdate', promptTokens: 42, completionTokens: 8 } });
+    notify('session/update', {
+      sessionId: currentSessionId,
+      update: { type: 'AgentMessageChunk', content: { text: 'Usage test response' } },
+    });
+    notify('session/update', {
+      sessionId: currentSessionId,
+      update: { type: 'UsageUpdate', promptTokens: 42, completionTokens: 8 },
+    });
   } else {
     for (const word of ['Hello', ' from', ' mock', ' acp']) {
-      notify('session/update', { sessionId: currentSessionId, update: { type: 'AgentMessageChunk', content: { text: word } } });
+      notify('session/update', {
+        sessionId: currentSessionId,
+        update: { type: 'AgentMessageChunk', content: { text: word } },
+      });
     }
   }
 
   ok(id);
 }
 
-rl.on('line', line => {
+rl.on('line', (line) => {
   line = line.trim();
   if (!line) return;
   let msg;
-  try { msg = JSON.parse(line); } catch { return; }
+  try {
+    msg = JSON.parse(line);
+  } catch {
+    return;
+  }
 
   const { id, method } = msg;
 
   // Record the initialized notification (arrives with no id)
-  if (method === 'notifications/initialized') { seen.initialized = true; return; }
+  if (method === 'notifications/initialized') {
+    seen.initialized = true;
+    return;
+  }
 
   if (method === 'session/cancel') {
-    if (pendingPromptId != null) { ok(pendingPromptId); pendingPromptId = null; }
+    if (pendingPromptId != null) {
+      ok(pendingPromptId);
+      pendingPromptId = null;
+    }
     if (id != null) ok(id);
     return;
   }
@@ -127,7 +168,7 @@ rl.on('line', line => {
       break;
 
     case 'session/prompt':
-      handlePrompt(id).catch(e => rpcError(id, -32603, e.message));
+      handlePrompt(id).catch((e) => rpcError(id, -32603, e.message));
       break;
 
     default:

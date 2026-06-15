@@ -25,26 +25,34 @@ import { EventEmitter } from 'events';
 import { randomUUID, createHash } from 'crypto';
 import path from 'path';
 import fs from 'fs';
+// Native `codex app-server` backend (non-ACP protocol) — separate session class.
+import { makeAppServerProfile, AppServerSession } from './codex-appserver.js';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const PORT             = parseInt(process.env.PORT             ?? '3456');
-const HOST             = process.env.HOST                      ?? '127.0.0.1';
-const ALLOW_INSECURE   = process.env.ALLOW_INSECURE_REMOTE     === '1';
-const CWD              = process.env.ACP_CWD ?? process.env.KIRO_CWD ?? process.env.CODEX_CWD ?? process.cwd();
-const DEBUG            = process.env.DEBUG                     === '1';
-const POOL_SIZE        = parseInt(process.env.POOL_SIZE        ?? '4');
-const POOL_PRECREATE   = process.env.POOL_PRECREATE           === '1';
+const PORT = parseInt(process.env.PORT ?? '3456');
+const HOST = process.env.HOST ?? '127.0.0.1';
+const ALLOW_INSECURE = process.env.ALLOW_INSECURE_REMOTE === '1';
+const CWD = process.env.ACP_CWD ?? process.env.KIRO_CWD ?? process.env.CODEX_CWD ?? process.cwd();
+const DEBUG = process.env.DEBUG === '1';
+const POOL_SIZE = parseInt(process.env.POOL_SIZE ?? '4');
+const POOL_PRECREATE = process.env.POOL_PRECREATE === '1';
 // Trim the system prompt on a REUSED stateful thread: codex already has it from the
 // first turn, so re-sending it every turn re-prefills it (defeating the prefix cache).
 // Experimental/opt-in — relies on codex retaining the first-turn system instructions.
 const TRIM_SYSTEM_ON_REUSE = process.env.TRIM_SYSTEM_ON_REUSE === '1';
-const SESSION_TTL_MS   = parseInt(process.env.SESSION_TTL_MS   ?? String(30 * 60 * 1000));
-const PING_INTERVAL_MS = parseInt(process.env.PING_INTERVAL    ?? '60000');
-const MAX_EXEC_MS      = parseInt(process.env.MAX_EXEC_MS      ?? String(10 * 60 * 1000));
-const ACP_API_KEYS     = (process.env.ACP_API_KEY ?? '').split(',').map(t => t.trim()).filter(Boolean);
-const ALLOWED_IPS      = (process.env.ALLOWED_IPS ?? '').split(',').map(t => t.trim()).filter(Boolean);
-const AUTO_SESSION_HASH = process.env.AUTO_SESSION_HASH        === '1';
+const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS ?? String(30 * 60 * 1000));
+const PING_INTERVAL_MS = parseInt(process.env.PING_INTERVAL ?? '60000');
+const MAX_EXEC_MS = parseInt(process.env.MAX_EXEC_MS ?? String(10 * 60 * 1000));
+const ACP_API_KEYS = (process.env.ACP_API_KEY ?? '')
+  .split(',')
+  .map((t) => t.trim())
+  .filter(Boolean);
+const ALLOWED_IPS = (process.env.ALLOWED_IPS ?? '')
+  .split(',')
+  .map((t) => t.trim())
+  .filter(Boolean);
+const AUTO_SESSION_HASH = process.env.AUTO_SESSION_HASH === '1';
 
 // ─── Backend profiles ─────────────────────────────────────────────────────────
 // This file exposes the OpenAI REST surface; the ACP backend is selected with the
@@ -55,22 +63,30 @@ const AUTO_SESSION_HASH = process.env.AUTO_SESSION_HASH        === '1';
 // >>> BACKENDS
 const BACKENDS = {
   kiro: (env) => ({
-    name:  'kiro',
+    name: 'kiro',
     label: 'kiro-cli',
-    cmd:   env.KIRO_CMD ?? 'kiro-cli',
-    args:  (env.KIRO_ARGS ?? 'acp').split(' ').filter(Boolean),
+    cmd: env.KIRO_CMD ?? 'kiro-cli',
+    args: (env.KIRO_ARGS ?? 'acp').split(' ').filter(Boolean),
     clientName: 'acp-proxy',
     requiresAuthWhenRemote: false,
     sendInitialized: false,
     mode: null,
     defaultModel: 'auto',
+    autoModel: null, // no concrete models — 'auto' stays 'auto'
     fallbackModels: ['auto'],
-    buildEnv(parent) { return { ...parent }; },
-    formatStartupModels(ids) { return ['auto', ...ids.filter(id => id !== 'auto')]; },
+    buildEnv(parent) {
+      return { ...parent };
+    },
+    formatStartupModels(ids) {
+      return ['auto', ...ids.filter((id) => id !== 'auto')];
+    },
     async postNewSession() {},
     async setModel(session, modelId) {
       if (!modelId || modelId === 'auto' || modelId === session.currentModel) return;
-      await session._reqSafe('model', 'session/set_model', { sessionId: session.sessionId, modelId });
+      await session._reqSafe('model', 'session/set_model', {
+        sessionId: session.sessionId,
+        modelId,
+      });
       session.currentModel = modelId;
     },
     async setReasoning() {},
@@ -97,15 +113,21 @@ const BACKENDS = {
           return out ? { kind: 'thought', text: out } : null;
         }
         case 'plan': {
-          const entries = (u.entries ?? []).map(e => e.content ?? e).join('\n');
+          const entries = (u.entries ?? []).map((e) => e.content ?? e).join('\n');
           return entries ? { kind: 'plan', text: entries } : null;
         }
-        default: return { kind: 'unhandled', type };
+        default:
+          return { kind: 'unhandled', type };
       }
     },
     dbgSkip(msg) {
       const m = msg.method;
-      if (m === 'session/update' || m === 'session/notification' || m === '_kiro.dev/session/update') return 'skip';
+      if (
+        m === 'session/update' ||
+        m === 'session/notification' ||
+        m === '_kiro.dev/session/update'
+      )
+        return 'skip';
       if (m === '_kiro.dev/commands/available') return 'commands';
       if (m === '_kiro.dev/subagent/list_update') return 'skip';
       if (!m && msg.error?.data === 'ping') return 'skip';
@@ -113,34 +135,52 @@ const BACKENDS = {
     },
   }),
   codex: (env) => ({
-    name:  'codex',
+    name: 'codex',
     label: 'codex-acp',
-    cmd:   env.CODEX_CMD ?? 'codex-acp',
-    args:  (env.CODEX_ARGS ?? '').split(' ').filter(Boolean),
+    cmd: env.CODEX_CMD ?? 'codex-acp',
+    args: (env.CODEX_ARGS ?? '').split(' ').filter(Boolean),
     clientName: 'acp-proxy',
     requiresAuthWhenRemote: true,
     sendInitialized: true,
     mode: env.CODEX_MODE ?? 'full-access',
     defaultModel: env.CODEX_MODEL_DEFAULT ?? 'gpt-5.5',
-    fallbackModels: (env.CODEX_AVAILABLE_MODELS ?? 'gpt-5.5,gpt-5.4,gpt-5.4-mini').split(',').map(s => s.trim()).filter(Boolean),
+    // 'auto' resolves to this lean model instead of the heavy default (low latency).
+    autoModel: env.CODEX_AUTO_MODEL ?? 'gpt-5.4-mini',
+    fallbackModels: (env.CODEX_AVAILABLE_MODELS ?? 'gpt-5.5,gpt-5.4,gpt-5.4-mini')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
     buildEnv(parent) {
       // codex-acp authenticates via codex's own login over ACP; OPENAI_API_KEY is
       // optional and passed through only when present (API-key auth). Not required.
       return { ...parent };
     },
-    formatStartupModels(ids) { return [...new Set(ids)]; },
+    formatStartupModels(ids) {
+      return [...new Set(ids)];
+    },
     async postNewSession(session) {
       if (!session.sessionId || !this.mode) return;
-      await session._reqSafe('mode', 'session/set_mode', { sessionId: session.sessionId, modeId: this.mode });
+      await session._reqSafe('mode', 'session/set_mode', {
+        sessionId: session.sessionId,
+        modeId: this.mode,
+      });
     },
     async setModel(session, modelId) {
       if (!modelId || modelId === 'auto' || modelId === session.currentModel) return;
-      await session._reqSafe('model', 'session/set_config_option', { sessionId: session.sessionId, configId: 'model', value: modelId });
+      await session._reqSafe('model', 'session/set_config_option', {
+        sessionId: session.sessionId,
+        configId: 'model',
+        value: modelId,
+      });
       session.currentModel = modelId;
     },
     async setReasoning(session, effort) {
       if (!effort) return;
-      await session._reqSafe('reasoning', 'session/set_config_option', { sessionId: session.sessionId, configId: 'reasoning_effort', value: effort });
+      await session._reqSafe('reasoning', 'session/set_config_option', {
+        sessionId: session.sessionId,
+        configId: 'reasoning_effort',
+        value: effort,
+      });
     },
     updateMethods: new Set(['session/update', 'session/notification']),
     parseUpdate(params) {
@@ -148,24 +188,44 @@ const BACKENDS = {
       let type = u.sessionUpdate ?? u.type ?? '';
       let payload = u;
       if (!type) {
-        const keys = Object.keys(u).filter(k => k !== 'sessionId');
-        if (keys.length >= 1) { type = keys[0]; payload = u[type] ?? u; }
+        const keys = Object.keys(u).filter((k) => k !== 'sessionId');
+        if (keys.length >= 1) {
+          type = keys[0];
+          payload = u[type] ?? u;
+        }
       }
       switch (type) {
         case 'agent_message_chunk':
         case 'AgentMessageChunk': {
-          const text = payload.content?.text ?? payload.content ?? payload.text ?? u.content?.text ?? u.content ?? u.text ?? '';
+          const text =
+            payload.content?.text ??
+            payload.content ??
+            payload.text ??
+            u.content?.text ??
+            u.content ??
+            u.text ??
+            '';
           return text ? { kind: 'text', text } : null;
         }
         case 'agent_thought_chunk':
         case 'AgentThoughtChunk': {
-          const text = payload.content?.text ?? payload.content ?? payload.text ?? u.content?.text ?? u.content ?? u.text ?? '';
+          const text =
+            payload.content?.text ??
+            payload.content ??
+            payload.text ??
+            u.content?.text ??
+            u.content ??
+            u.text ??
+            '';
           return text ? { kind: 'thought', text } : null;
         }
         case 'tool_call':
         case 'tool_call_chunk':
         case 'ToolCall':
-          return { kind: 'thought', text: `[tool: ${payload.title ?? payload.name ?? u.title ?? u.name ?? 'unknown'}]\n` };
+          return {
+            kind: 'thought',
+            text: `[tool: ${payload.title ?? payload.name ?? u.title ?? u.name ?? 'unknown'}]\n`,
+          };
         case 'tool_call_update':
         case 'ToolCallUpdate': {
           const out = payload.output ?? payload.content?.text ?? u.output ?? u.content?.text;
@@ -173,16 +233,24 @@ const BACKENDS = {
         }
         case 'plan':
         case 'Plan': {
-          const entries = (payload.entries ?? u.entries ?? []).map(e => e.content ?? e).join('\n');
+          const entries = (payload.entries ?? u.entries ?? [])
+            .map((e) => e.content ?? e)
+            .join('\n');
           return entries ? { kind: 'plan', text: entries } : null;
         }
         case 'UsageUpdate':
         case 'usage_update': {
-          const pt = payload.promptTokens ?? payload.prompt_tokens ?? u.promptTokens ?? u.prompt_tokens;
-          const ct = payload.completionTokens ?? payload.completion_tokens ?? u.completionTokens ?? u.completion_tokens;
+          const pt =
+            payload.promptTokens ?? payload.prompt_tokens ?? u.promptTokens ?? u.prompt_tokens;
+          const ct =
+            payload.completionTokens ??
+            payload.completion_tokens ??
+            u.completionTokens ??
+            u.completion_tokens;
           return pt != null ? { kind: 'usage', promptTokens: pt, completionTokens: ct ?? 0 } : null;
         }
-        default: return { kind: 'unhandled', type };
+        default:
+          return { kind: 'unhandled', type };
       }
     },
     dbgSkip(msg) {
@@ -192,21 +260,38 @@ const BACKENDS = {
       return null;
     },
   }),
+  // Native `codex app-server` (non-ACP). The profile carries only the fields the
+  // shared REST/pool/startup layers read; AppServerSession (SessionClass) owns the
+  // protocol. pool/registry instantiate PROFILE.SessionClass ?? ACPSession.
+  'codex-appserver': (env) => ({
+    ...makeAppServerProfile(env),
+    SessionClass: AppServerSession,
+  }),
 };
 // <<< BACKENDS
 
 const DEFAULT_BACKEND = 'codex';
-const _backendArg  = process.argv.find(a => a.startsWith('--backend='))?.split('=')[1];
-const BACKEND_NAME = ((_backendArg ?? '').trim().toLowerCase()) || DEFAULT_BACKEND;
+const _backendArg = process.argv.find((a) => a.startsWith('--backend='))?.split('=')[1];
+const BACKEND_NAME = (_backendArg ?? '').trim().toLowerCase() || DEFAULT_BACKEND;
 if (!BACKENDS[BACKEND_NAME]) {
-  console.error(`[startup] ERROR: unknown --backend="${BACKEND_NAME}" (expected: ${Object.keys(BACKENDS).join('|')})`);
+  console.error(
+    `[startup] ERROR: unknown --backend="${BACKEND_NAME}" (expected: ${Object.keys(BACKENDS).join('|')})`,
+  );
   process.exit(1);
 }
 const PROFILE = BACKENDS[BACKEND_NAME](process.env);
 
 // Remote binding safety gate — a full-access backend must have auth when not on localhost
-if (PROFILE.requiresAuthWhenRemote && HOST !== '127.0.0.1' && HOST !== 'localhost' && ACP_API_KEYS.length === 0 && !ALLOW_INSECURE) {
-  console.error(`[startup] ERROR: HOST=${HOST} with no ACP_API_KEY is unsafe for the ${PROFILE.name} backend (full-access agent).`);
+if (
+  PROFILE.requiresAuthWhenRemote &&
+  HOST !== '127.0.0.1' &&
+  HOST !== 'localhost' &&
+  ACP_API_KEYS.length === 0 &&
+  !ALLOW_INSECURE
+) {
+  console.error(
+    `[startup] ERROR: HOST=${HOST} with no ACP_API_KEY is unsafe for the ${PROFILE.name} backend (full-access agent).`,
+  );
   console.error(`[startup] Set ACP_API_KEY or set ALLOW_INSECURE_REMOTE=1 to override.`);
   process.exit(1);
 }
@@ -215,23 +300,46 @@ if (PROFILE.requiresAuthWhenRemote && HOST !== '127.0.0.1' && HOST !== 'localhos
 
 // Debug log file — created at startup when DEBUG=1, captures ALL output.
 let _logStream = null;
-let _logPath   = null;
+let _logPath = null;
 
 if (DEBUG) {
   const logDir = process.env.LOG_DIR ?? path.join(process.cwd(), 'logs');
   fs.mkdirSync(logDir, { recursive: true });
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
-  _logPath   = path.join(logDir, `acp-codex-${stamp}.log`);
+  _logPath = path.join(logDir, `acp-codex-${stamp}.log`);
   _logStream = fs.createWriteStream(_logPath, { flags: 'a', encoding: 'utf8' });
-  _logStream.write(`=== acp-codex debug log  pid=${process.pid}  started=${new Date().toISOString()} ===\n`);
+  _logStream.write(
+    `=== acp-codex debug log  pid=${process.pid}  started=${new Date().toISOString()} ===\n`,
+  );
   process.stderr.write(`[startup] debug log → ${_logPath}\n`);
 }
 
-function ts() { return new Date().toISOString().replace(/(\.\d{3})Z$/, (_, ms) => ms + '000Z'); }
+// Log-line timestamp in US Pacific wall-clock time (auto PST/PDT label). Only the
+// log prefix is localized — API response fields elsewhere stay UTC ISO 8601.
+function ts() {
+  const d = new Date();
+  const p = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+    timeZoneName: 'short',
+  })
+    .formatToParts(d)
+    .reduce((a, x) => ((a[x.type] = x.value), a), {});
+  const ms = String(d.getMilliseconds()).padStart(3, '0');
+  return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}:${p.second}.${ms}000 ${p.timeZoneName}`;
+}
 
 // Write to the log file only (no stderr/stdout). Used for verbose messages that
 // would flood the console but are valuable for offline analysis.
-function _fileLine(line) { _logStream?.write(line + '\n'); }
+function _fileLine(line) {
+  _logStream?.write(line + '\n');
+}
 
 function log(tag, ...args) {
   const line = `${ts()} [${tag}] ${args.join(' ')}`;
@@ -248,10 +356,18 @@ function dbg(tag, ...args) {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function makeId()         { return `chatcmpl-${randomUUID().replace(/-/g, '').slice(0, 24)}`; }
-function makeToolCallId() { return `call_${randomUUID().replace(/-/g, '').slice(0, 16)}`; }
-function makeReqId()      { return `req_${randomUUID().replace(/-/g, '').slice(0, 24)}`; }
-function nowSec()         { return Math.floor(Date.now() / 1000); }
+function makeId() {
+  return `chatcmpl-${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+}
+function makeToolCallId() {
+  return `call_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
+}
+function makeReqId() {
+  return `req_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+}
+function nowSec() {
+  return Math.floor(Date.now() / 1000);
+}
 
 // OpenAI reasoning_effort values that pass through to the backend (codex maps these
 // to ReasoningEffort; 'none'/'xhigh' are codex extensions accepted if a client sends them).
@@ -274,54 +390,61 @@ function _ns2ms(a, b) {
   return a != null && b != null ? Number((Number(b - a) / 1e6).toFixed(1)) : null;
 }
 
-const _timings = [];           // ring buffer of recent splits (DEBUG only)
+const _timings = []; // ring buffer of recent splits (DEBUG only)
 const _TIMINGS_MAX = 200;
 
 function recordTiming(marks, meta, chunks) {
   const m = marks;
   // Reply-side stats from the collected chunks (explains gen_ms / output size).
-  let nText = 0, nThought = 0, replyChars = 0;
+  let nText = 0,
+    nThought = 0,
+    replyChars = 0;
   for (const c of chunks ?? []) {
-    if (c.kind === 'text') { nText++; replyChars += c.text?.length ?? 0; }
-    else if (c.kind === 'thought') nThought++;
+    if (c.kind === 'text') {
+      nText++;
+      replyChars += c.text?.length ?? 0;
+    } else if (c.kind === 'thought') nThought++;
   }
   const rec = {
-    rid:    meta.rid,
-    model:  meta.model,
-    mode:   meta.mode,
-    tools:  meta.tools,
+    rid: meta.rid,
+    model: meta.model,
+    mode: meta.mode,
+    tools: meta.tools,
     stream: meta.stream,
-    session: meta.session ?? null,                                  // new | reuse | cleared
-    prompt_chars:      meta.promptChars ?? null,                    // drives prefill_ms
+    session: meta.session ?? null, // new | reuse | cleared
+    prompt_chars: meta.promptChars ?? null, // drives prefill_ms
     prompt_tokens_est: meta.promptChars != null ? Math.ceil(meta.promptChars / 4) : null,
-    n_messages:        meta.nMessages ?? null,
-    n_tools:           meta.nTools ?? null,
-    acquire_ms:       _ns2ms(m.t_req_start, m.t_acquired),
-    session_new_ms:   _ns2ms(m.t_acquired, m.t_session_created),
-    set_mode_ms:      _ns2ms(m.t_session_created, m.t_post_session),
-    set_model_ms:     _ns2ms(m.t_post_session ?? m.t_acquired, m.t_set_model),
-    prefill_ms:       _ns2ms(m.t_prompt_sent, m.t_first_update),
-    thought_gap_ms:   _ns2ms(m.t_first_update, m.t_first_thought),
+    n_messages: meta.nMessages ?? null,
+    n_tools: meta.nTools ?? null,
+    acquire_ms: _ns2ms(m.t_req_start, m.t_acquired),
+    session_new_ms: _ns2ms(m.t_acquired, m.t_session_created),
+    set_mode_ms: _ns2ms(m.t_session_created, m.t_post_session),
+    set_model_ms: _ns2ms(m.t_post_session ?? m.t_acquired, m.t_set_model),
+    prefill_ms: _ns2ms(m.t_prompt_sent, m.t_first_update),
+    thought_gap_ms: _ns2ms(m.t_first_update, m.t_first_thought),
     reasoning_gap_ms: _ns2ms(m.t_first_update, m.t_first_text),
-    gen_ms:           _ns2ms(m.t_first_text, m.t_complete),
-    total_ms:         _ns2ms(m.t_req_start, m.t_complete),
-    reply_chars:      chunks ? replyChars : null,
-    n_text:           chunks ? nText : null,
-    n_thought:        chunks ? nThought : null,
-    n_chunks:         chunks ? chunks.length : null,
+    gen_ms: _ns2ms(m.t_first_text, m.t_complete),
+    total_ms: _ns2ms(m.t_req_start, m.t_complete),
+    reply_chars: chunks ? replyChars : null,
+    n_text: chunks ? nText : null,
+    n_thought: chunks ? nThought : null,
+    n_chunks: chunks ? chunks.length : null,
   };
   if (DEBUG) {
     _timings.push(rec);
     if (_timings.length > _TIMINGS_MAX) _timings.shift();
     dbg('timing', JSON.stringify(rec));
     // One-line summary so the bottleneck is obvious without parsing JSON.
-    log('perf', `${rec.session ?? '-'}  in=${rec.prompt_tokens_est ?? '?'}tok/${rec.n_tools ?? 0}tools  prefill=${rec.prefill_ms ?? '?'}ms  reason=${rec.reasoning_gap_ms ?? 0}ms  gen=${rec.gen_ms ?? '?'}ms  total=${rec.total_ms ?? '?'}ms  rid=${rec.rid}`);
+    log(
+      'perf',
+      `${rec.session ?? '-'}  in=${rec.prompt_tokens_est ?? '?'}tok/${rec.n_tools ?? 0}tools  prefill=${rec.prefill_ms ?? '?'}ms  reason=${rec.reasoning_gap_ms ?? 0}ms  gen=${rec.gen_ms ?? '?'}ms  total=${rec.total_ms ?? '?'}ms  rid=${rec.rid}`,
+    );
   }
   return rec;
 }
 
 function autoSessionId(messages) {
-  const sys = messages?.find?.(m => m.role === 'system');
+  const sys = messages?.find?.((m) => m.role === 'system');
   const key = sys ? contentText(sys.content) : '__no_system__';
   return 'auto:' + createHash('sha1').update(key).digest('hex').slice(0, 16);
 }
@@ -333,16 +456,17 @@ function estimateTokens(text) {
 
 function pickCwd(blocks, fallback) {
   const dirs = blocks
-    .filter(b => b.type === 'resource_link' && typeof b.uri === 'string')
-    .map(b => b.uri.replace(/^file:\/\//, ''))
-    .map(p => path.posix.dirname(p));
+    .filter((b) => b.type === 'resource_link' && typeof b.uri === 'string')
+    .map((b) => b.uri.replace(/^file:\/\//, ''))
+    .map((p) => path.posix.dirname(p));
   if (!dirs.length) return fallback;
   if (dirs.length === 1) return dirs[0];
-  const split = dirs.map(d => d.split('/'));
+  const split = dirs.map((d) => d.split('/'));
   const common = [];
   for (let i = 0; i < split[0].length; i++) {
     const seg = split[0][i];
-    if (split.every(s => s[i] === seg)) common.push(seg); else break;
+    if (split.every((s) => s[i] === seg)) common.push(seg);
+    else break;
   }
   return common.join('/') || fallback;
 }
@@ -353,31 +477,43 @@ function apiError(res, status, message, type = 'api_error', param = null, code =
 
 function inferMimeType(b64) {
   const head = b64.slice(0, 8);
-  if (head.startsWith('/9j/'))      return 'image/jpeg';
+  if (head.startsWith('/9j/')) return 'image/jpeg';
   if (head.startsWith('iVBORw0K')) return 'image/png';
-  if (head.startsWith('R0lGOD'))   return 'image/gif';
-  if (head.startsWith('UklGR'))    return 'image/webp';
+  if (head.startsWith('R0lGOD')) return 'image/gif';
+  if (head.startsWith('UklGR')) return 'image/webp';
   return 'image/jpeg';
 }
 
 function contentText(c) {
   if (typeof c === 'string') return c;
-  if (Array.isArray(c)) return c.filter(p => p.type === 'text').map(p => p.text ?? '').join('');
+  if (Array.isArray(c))
+    return c
+      .filter((p) => p.type === 'text')
+      .map((p) => p.text ?? '')
+      .join('');
   return String(c ?? '');
 }
 
 function tryParseJson(str) {
-  try { return JSON.parse(str?.trim()); } catch { return null; }
+  try {
+    return JSON.parse(str?.trim());
+  } catch {
+    return null;
+  }
 }
 
 function pickBestTool(obj, tools) {
   if (tools.length === 1) return tools[0];
   const objKeys = new Set(Object.keys(obj));
-  let best = tools[0], bestScore = 0;
+  let best = tools[0],
+    bestScore = 0;
   for (const t of tools) {
     const props = Object.keys(t?.function?.parameters?.properties ?? {});
-    const score = props.filter(k => objKeys.has(k)).length;
-    if (score > bestScore) { bestScore = score; best = t; }
+    const score = props.filter((k) => objKeys.has(k)).length;
+    if (score > bestScore) {
+      bestScore = score;
+      best = t;
+    }
   }
   return best;
 }
@@ -388,17 +524,28 @@ function parsePyFnCallArgs(argsStr, toolDef) {
   let m;
   while ((m = kwRe.exec(argsStr)) !== null) {
     const [, key, raw] = m;
-    if      (raw === 'true')       args[key] = true;
-    else if (raw === 'false')      args[key] = false;
-    else if (raw === 'null')       args[key] = null;
-    else if (raw.startsWith('"')) { try { args[key] = JSON.parse(raw); } catch { args[key] = raw.slice(1, -1); } }
-    else                           args[key] = parseFloat(raw);
+    if (raw === 'true') args[key] = true;
+    else if (raw === 'false') args[key] = false;
+    else if (raw === 'null') args[key] = null;
+    else if (raw.startsWith('"')) {
+      try {
+        args[key] = JSON.parse(raw);
+      } catch {
+        args[key] = raw.slice(1, -1);
+      }
+    } else args[key] = parseFloat(raw);
   }
   if (!Object.keys(args).length) {
     const pos = argsStr.trim().match(/^"((?:[^"\\]|\\.)*)"$/s);
     if (pos) {
       const firstKey = Object.keys(toolDef?.function?.parameters?.properties ?? {})[0];
-      if (firstKey) { try { args[firstKey] = JSON.parse(`"${pos[1]}"`); } catch { args[firstKey] = pos[1]; } }
+      if (firstKey) {
+        try {
+          args[firstKey] = JSON.parse(`"${pos[1]}"`);
+        } catch {
+          args[firstKey] = pos[1];
+        }
+      }
     }
   }
   return args;
@@ -407,11 +554,18 @@ function parsePyFnCallArgs(argsStr, toolDef) {
 async function cancelWithGrace(client, graceMs = 3000) {
   if (!client?.alive) return;
   client.cancel();
-  if (client._pending.size === 0) return;
-  await new Promise(resolve => {
+  // ACPSession tracks in-flight work in _pending (RPC); AppServerSession tracks the
+  // async turn in _turns. Drain on whichever is non-empty so the grace wait applies.
+  const inflight = () => client._pending.size + (client._turns?.size ?? 0);
+  if (inflight() === 0) return;
+  await new Promise((resolve) => {
     const t = setTimeout(resolve, graceMs);
     const iv = setInterval(() => {
-      if (client._pending.size === 0) { clearInterval(iv); clearTimeout(t); resolve(); }
+      if (inflight() === 0) {
+        clearInterval(iv);
+        clearTimeout(t);
+        resolve();
+      }
     }, 50);
   });
 }
@@ -421,49 +575,62 @@ async function cancelWithGrace(client, graceMs = 3000) {
 class ACPSession extends EventEmitter {
   constructor(label = 'anon') {
     super();
-    this.label      = label;
-    this._proc      = null;
-    this._rl        = null;
-    this._msgId     = 0;
-    this._pending   = new Map();
-    this.sessionId  = null;
-    this.sessionCwd = null;          // cwd the active session was created with (pool reuse)
-    this._sessionConsumed = false;   // true once a stateless turn has used this session
+    this.label = label;
+    this._proc = null;
+    this._rl = null;
+    this._msgId = 0;
+    this._pending = new Map();
+    this.sessionId = null;
+    this.sessionCwd = null; // cwd the active session was created with (pool reuse)
+    this._sessionConsumed = false; // true once a stateless turn has used this session
     this._pingTimer = null;
-    this._dead      = false;
+    this._dead = false;
   }
 
   async start() {
     this._proc = spawn(PROFILE.cmd, PROFILE.args, {
-      cwd:   CWD,
+      cwd: CWD,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env:   PROFILE.buildEnv(process.env),
+      env: PROFILE.buildEnv(process.env),
     });
-    this._proc.stderr.on('data', d => dbg(`${PROFILE.name}:${this.label}`, String(d).trim()));
-    this._proc.once('exit', code => {
+    this._proc.stderr.on('data', (d) => dbg(`${PROFILE.name}:${this.label}`, String(d).trim()));
+    this._proc.once('exit', (code) => {
       this._dead = true;
       this._stopPing();
       log(`proc:${this.label}`, `exited (${code}), failing ${this._pending.size} pending`);
-      for (const [, { reject }] of this._pending) reject(new Error(`${PROFILE.label} exited (${code})`));
+      for (const [, { reject }] of this._pending)
+        reject(new Error(`${PROFILE.label} exited (${code})`));
       this._pending.clear();
       this.emit('dead');
     });
     this._rl = readline.createInterface({ input: this._proc.stdout });
-    this._rl.on('line', line => {
+    this._rl.on('line', (line) => {
       line = line.trim();
       if (!line) return;
       try {
         const msg = JSON.parse(line);
         this._dbgLine(msg);
         this._route(msg);
-      } catch (e) { dbg('parse', e.message); }
+      } catch (e) {
+        dbg('parse', e.message);
+      }
     });
     await new Promise((res, rej) => {
       let done = false;
-      const ok = () => { if (!done) { done = true; res(); } };
+      const ok = () => {
+        if (!done) {
+          done = true;
+          res();
+        }
+      };
       this._proc.stdout.once('readable', ok);
       setTimeout(ok, 600);
-      this._proc.once('exit', c => { if (!done) { done = true; rej(new Error(`died at startup (${c})`)); } });
+      this._proc.once('exit', (c) => {
+        if (!done) {
+          done = true;
+          rej(new Error(`died at startup (${c})`));
+        }
+      });
     });
   }
 
@@ -472,10 +639,14 @@ class ACPSession extends EventEmitter {
     const line = JSON.stringify(msg) + '\n';
     if (DEBUG) {
       // File: log every outgoing message including ping
-      _fileLine(`${ts()} [ACP→${this.label}] ${line.length > 2001 ? line.slice(0, 2000) + '…' : line.trimEnd()}`);
+      _fileLine(
+        `${ts()} [ACP→${this.label}] ${line.length > 2001 ? line.slice(0, 2000) + '…' : line.trimEnd()}`,
+      );
       // Stderr: skip ping to keep console readable
       if (msg.method !== 'ping')
-        process.stderr.write(`${ts()} [DBG:→${this.label}] ${line.length > 301 ? line.slice(0, 300) + '…' : line.trimEnd()}\n`);
+        process.stderr.write(
+          `${ts()} [DBG:→${this.label}] ${line.length > 301 ? line.slice(0, 300) + '…' : line.trimEnd()}\n`,
+        );
     }
     this._proc.stdin.write(line);
   }
@@ -491,17 +662,26 @@ class ACPSession extends EventEmitter {
   close() {
     this._dead = true;
     this._stopPing();
-    try { this._proc?.stdin.end(); this._proc?.kill(); } catch {}
+    try {
+      this._proc?.stdin.end();
+      this._proc?.kill();
+    } catch {}
   }
 
   cancel() {
     if (!this.alive || !this.sessionId) return;
     try {
-      this._send({ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId: this.sessionId } });
+      this._send({
+        jsonrpc: '2.0',
+        method: 'session/cancel',
+        params: { sessionId: this.sessionId },
+      });
     } catch {}
   }
 
-  get alive() { return !this._dead && this._proc && !this._proc.killed; }
+  get alive() {
+    return !this._dead && this._proc && !this._proc.killed;
+  }
 
   _dbgLine(msg) {
     if (!DEBUG) return;
@@ -513,10 +693,14 @@ class ACPSession extends EventEmitter {
     if (skip === 'skip') return;
     if (skip === 'commands') {
       const p = msg.params ?? {};
-      process.stderr.write(`${ts()} [DBG:←${this.label}] commands/available  commands=${p.commands?.length ?? 0}  tools=${p.tools?.length ?? 0}  mcp=${p.mcpServers?.length ?? 0}\n`);
+      process.stderr.write(
+        `${ts()} [DBG:←${this.label}] commands/available  commands=${p.commands?.length ?? 0}  tools=${p.tools?.length ?? 0}  mcp=${p.mcpServers?.length ?? 0}\n`,
+      );
       return;
     }
-    process.stderr.write(`${ts()} [DBG:←${this.label}] ${raw.length > 301 ? raw.slice(0, 300) + '…' : raw}\n`);
+    process.stderr.write(
+      `${ts()} [DBG:←${this.label}] ${raw.length > 301 ? raw.slice(0, 300) + '…' : raw}\n`,
+    );
   }
 
   _route(msg) {
@@ -531,7 +715,11 @@ class ACPSession extends EventEmitter {
 
     // Permission auto-grant
     if (msg.method === 'session/request_permission') {
-      this._send({ jsonrpc: '2.0', id: msg.id, result: { optionId: 'allow_always', granted: true } });
+      this._send({
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: { optionId: 'allow_always', granted: true },
+      });
       return;
     }
 
@@ -539,15 +727,21 @@ class ACPSession extends EventEmitter {
     if (PROFILE.updateMethods.has(msg.method)) {
       const c = PROFILE.parseUpdate(msg.params ?? {});
       if (!c) return;
-      if (c.kind === 'unhandled') { dbg(`update:${this.label}`, `unhandled "${c.type}"`); return; }
+      if (c.kind === 'unhandled') {
+        dbg(`update:${this.label}`, `unhandled "${c.type}"`);
+        return;
+      }
       this.emit('chunk', c);
     }
   }
 
   // Like _req, but catches+logs instead of throwing — used for best-effort calls.
   async _reqSafe(tag, method, params) {
-    try { return await this._req(method, params); }
-    catch (e) { log(`${tag}:${this.label}`, `${method} failed (${e.message})`); }
+    try {
+      return await this._req(method, params);
+    } catch (e) {
+      log(`${tag}:${this.label}`, `${method} failed (${e.message})`);
+    }
   }
 
   async initialize() {
@@ -560,18 +754,19 @@ class ACPSession extends EventEmitter {
     this.promptCapabilities = caps;
     dbg(`init:${this.label}`, `promptCapabilities=${JSON.stringify(caps)}`);
     // Codex expects the initialized notification; Kiro rejects it (profile-gated).
-    if (PROFILE.sendInitialized) this._send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+    if (PROFILE.sendInitialized)
+      this._send({ jsonrpc: '2.0', method: 'notifications/initialized' });
     this._startPing();
   }
 
   async newSession(cwd = CWD, timings) {
     const result = await this._req('session/new', { cwd, mcpServers: [] });
     if (timings) timings.t_session_created = process.hrtime.bigint();
-    this.sessionCwd       = cwd;
+    this.sessionCwd = cwd;
     this._sessionConsumed = false;
-    this.sessionId       = result?.sessionId ?? result?.id;
-    this.availableModels = result?.models?.availableModels?.map(m => m.modelId) ?? [];
-    this.currentModel    = result?.models?.currentModelId ?? 'auto';
+    this.sessionId = result?.sessionId ?? result?.id;
+    this.availableModels = result?.models?.availableModels?.map((m) => m.modelId) ?? [];
+    this.currentModel = result?.models?.currentModelId ?? 'auto';
     // Backend-specific post-session setup (e.g. codex session/set_mode full-access)
     await PROFILE.postNewSession(this);
     if (timings) timings.t_post_session = process.hrtime.bigint();
@@ -588,12 +783,12 @@ class ACPSession extends EventEmitter {
 
   async prompt(blocks, onChunk, timings) {
     const chunks = [];
-    const handler = c => {
+    const handler = (c) => {
       if (timings) {
         const now = process.hrtime.bigint();
-        if (timings.t_first_update  == null) timings.t_first_update  = now;
+        if (timings.t_first_update == null) timings.t_first_update = now;
         if (c.kind === 'thought' && timings.t_first_thought == null) timings.t_first_thought = now;
-        if (c.kind === 'text'    && timings.t_first_text    == null) timings.t_first_text    = now;
+        if (c.kind === 'text' && timings.t_first_text == null) timings.t_first_text = now;
       }
       chunks.push(c);
       onChunk?.(c);
@@ -604,8 +799,8 @@ class ACPSession extends EventEmitter {
     try {
       await this._req('session/prompt', {
         sessionId: this.sessionId,
-        prompt:    blocks,
-        content:   blocks,
+        prompt: blocks,
+        content: blocks,
       });
     } finally {
       this.off('chunk', handler);
@@ -617,7 +812,10 @@ class ACPSession extends EventEmitter {
 
   _startPing() {
     this._pingTimer = setInterval(async () => {
-      if (!this.alive) { this._stopPing(); return; }
+      if (!this.alive) {
+        this._stopPing();
+        return;
+      }
       try {
         await Promise.race([
           this._req('ping', {}),
@@ -632,14 +830,27 @@ class ACPSession extends EventEmitter {
     this._pingTimer.unref();
   }
 
-  _stopPing() { if (this._pingTimer) { clearInterval(this._pingTimer); this._pingTimer = null; } }
+  _stopPing() {
+    if (this._pingTimer) {
+      clearInterval(this._pingTimer);
+      this._pingTimer = null;
+    }
+  }
+}
+
+// Instantiate the session class for the active backend. ACP backends use
+// ACPSession (module globals); codex-appserver uses its own class and needs the
+// interface-file globals injected via ctx (they are not visible from its module).
+function makeClient(label) {
+  const Cls = PROFILE.SessionClass ?? ACPSession;
+  return new Cls(label, { profile: PROFILE, cwd: CWD, debug: DEBUG, log, dbg });
 }
 
 // ─── Pool ─────────────────────────────────────────────────────────────────────
 
 class ACPPool {
   constructor(size) {
-    this._size  = size;
+    this._size = size;
     this._slots = [];
     this._queue = [];
   }
@@ -647,33 +858,42 @@ class ACPPool {
   async warmup() {
     log('pool', `warming ${this._size} ${PROFILE.label} processes…`);
     this._slots = Array.from({ length: this._size }, () => ({ client: null, busy: false }));
-    await Promise.all(this._slots.map(s => this._initSlot(s)));
-    log('pool', `ready (${this._slots.filter(s => s.client?.alive).length}/${this._size} live)`);
+    await Promise.all(this._slots.map((s) => this._initSlot(s)));
+    log('pool', `ready (${this._slots.filter((s) => s.client?.alive).length}/${this._size} live)`);
   }
 
   async _initSlot(slot) {
     try {
-      const c = new ACPSession(`pool-${this._slots.indexOf(slot)}`);
+      const c = makeClient(`pool-${this._slots.indexOf(slot)}`);
       await c.start();
       await c.initialize();
       // POOL_PRECREATE: pre-pay session/new + set_mode at warmup so stateless
       // requests can skip it on their critical path (recycled on release).
       if (POOL_PRECREATE) await c.newSession(CWD);
-      c.once('dead', () => { slot.client = null; });
+      c.once('dead', () => {
+        slot.client = null;
+      });
       slot.client = c;
-    } catch (e) { log('pool', `slot init failed: ${e.message}`); slot.client = null; }
+    } catch (e) {
+      log('pool', `slot init failed: ${e.message}`);
+      slot.client = null;
+    }
   }
 
   async acquire() {
-    const free = this._slots.find(s => !s.busy);
+    const free = this._slots.find((s) => !s.busy);
     if (free) {
       free.busy = true;
       // Wait for any in-flight background recycle so the handler sees a settled session.
-      if (free._recycle) { try { await free._recycle; } catch {} }
+      if (free._recycle) {
+        try {
+          await free._recycle;
+        } catch {}
+      }
       if (!free.client?.alive) await this._initSlot(free);
       return free;
     }
-    return new Promise(resolve => this._queue.push(resolve));
+    return new Promise((resolve) => this._queue.push(resolve));
   }
 
   release(slot) {
@@ -689,19 +909,24 @@ class ACPPool {
     // in the background (fresh session/new) so the next acquirer gets an isolated,
     // already-warm session. The handler still re-creates inline if it grabs it first.
     if (POOL_PRECREATE && slot.client?.alive && slot.client._sessionConsumed) {
-      slot._recycle = slot.client.newSession(CWD)
-        .catch(e => log('pool', `recycle failed: ${e.message}`))
-        .finally(() => { slot._recycle = null; });
+      slot._recycle = slot.client
+        .newSession(CWD)
+        .catch((e) => log('pool', `recycle failed: ${e.message}`))
+        .finally(() => {
+          slot._recycle = null;
+        });
     }
   }
 
-  shutdown() { this._slots.forEach(s => s.client?.close()); }
+  shutdown() {
+    this._slots.forEach((s) => s.client?.close());
+  }
 
   get stats() {
     return {
-      size:   this._size,
-      busy:   this._slots.filter(s => s.busy).length,
-      alive:  this._slots.filter(s => s.client?.alive).length,
+      size: this._size,
+      busy: this._slots.filter((s) => s.busy).length,
+      alive: this._slots.filter((s) => s.client?.alive).length,
       queued: this._queue.length,
     };
   }
@@ -711,7 +936,7 @@ class ACPPool {
 
 class SessionRegistry {
   constructor() {
-    this._map   = new Map();
+    this._map = new Map();
     this._timer = setInterval(() => this._reap(), 60_000);
     this._timer.unref();
   }
@@ -725,7 +950,7 @@ class SessionRegistry {
     }
     let created = false;
     if (!entry) {
-      const c = new ACPSession(`reg-${sessionId.slice(0, 8)}`);
+      const c = makeClient(`reg-${sessionId.slice(0, 8)}`);
       await c.start();
       await c.initialize();
       await c.newSession(cwd);
@@ -738,7 +963,7 @@ class SessionRegistry {
 
     // Per-session FIFO serialization — prevents concurrent turns on same session
     if (entry._busy) {
-      await new Promise(resolve => entry._queue.push(resolve));
+      await new Promise((resolve) => entry._queue.push(resolve));
     }
     entry._busy = true;
 
@@ -755,7 +980,10 @@ class SessionRegistry {
 
   delete(sessionId) {
     const entry = this._map.get(sessionId);
-    if (entry) { entry.client.close(); this._map.delete(sessionId); }
+    if (entry) {
+      entry.client.close();
+      this._map.delete(sessionId);
+    }
   }
 
   _reap() {
@@ -769,21 +997,26 @@ class SessionRegistry {
     }
   }
 
-  get stats() { return { sessions: this._map.size }; }
+  get stats() {
+    return { sessions: this._map.size };
+  }
 }
 
 // ─── Globals ──────────────────────────────────────────────────────────────────
 
-const pool     = new ACPPool(POOL_SIZE);
+const pool = new ACPPool(POOL_SIZE);
 const registry = new SessionRegistry();
 
 await pool.warmup();
 
-['SIGINT', 'SIGTERM'].forEach(sig => {
+['SIGINT', 'SIGTERM'].forEach((sig) => {
   process.on(sig, () => {
     log('shutdown', sig);
     pool.shutdown();
-    if (_logStream) { _logStream.write(`=== shutdown  signal=${sig}  at=${new Date().toISOString()} ===\n`); _logStream.end(); }
+    if (_logStream) {
+      _logStream.write(`=== shutdown  signal=${sig}  at=${new Date().toISOString()} ===\n`);
+      _logStream.end();
+    }
     process.exit(0);
   });
 });
@@ -800,8 +1033,8 @@ await pool.warmup();
  */
 function buildAcpBlocks(messages, tools, opts = {}) {
   const { response_format, tool_choice } = opts;
-  const system = messages.find(m => m.role === 'system');
-  const turns  = messages.filter(m => m.role !== 'system');
+  const system = messages.find((m) => m.role === 'system');
+  const turns = messages.filter((m) => m.role !== 'system');
 
   let text = '';
 
@@ -820,11 +1053,19 @@ function buildAcpBlocks(messages, tools, opts = {}) {
   if (tools?.length) {
     text += `[Available tools]\n`;
     text += `To call a tool output ONLY this JSON block — no prose, no explanation, nothing else:\n`;
-    text += '```json\n{"tool_call": {"name": "<tool_name>", "arguments": {"<param>": "<value>"}}}\n```\n';
+    text +=
+      '```json\n{"tool_call": {"name": "<tool_name>", "arguments": {"<param>": "<value>"}}}\n```\n';
     text += 'Rules: (1) ONE tool call per response. (2) No text before or after the JSON block. ';
     text += '(3) Do NOT use ```tool_call``` fences or Python function-call syntax.\n';
     text += 'Available tools:\n';
-    text += '```json\n' + JSON.stringify(tools.map(t => t.function ?? t), null, 2) + '\n```\n\n';
+    text +=
+      '```json\n' +
+      JSON.stringify(
+        tools.map((t) => t.function ?? t),
+        null,
+        2,
+      ) +
+      '\n```\n\n';
   }
 
   const imageBlocks = [];
@@ -834,9 +1075,10 @@ function buildAcpBlocks(messages, tools, opts = {}) {
       if (m.tool_calls?.length) {
         for (const tc of m.tool_calls) {
           // arguments is a JSON string in OpenAI format
-          const args = typeof tc.function?.arguments === 'string'
-            ? tc.function.arguments
-            : JSON.stringify(tc.function?.arguments ?? {});
+          const args =
+            typeof tc.function?.arguments === 'string'
+              ? tc.function.arguments
+              : JSON.stringify(tc.function?.arguments ?? {});
           text += `[Assistant tool call: ${tc.function?.name ?? 'unknown'}]\n${args}\n\n`;
         }
       } else {
@@ -850,8 +1092,9 @@ function buildAcpBlocks(messages, tools, opts = {}) {
       const content = m.content;
       if (Array.isArray(content)) {
         const textContent = content
-          .filter(p => p.type === 'text')
-          .map(p => p.text ?? '').join('');
+          .filter((p) => p.type === 'text')
+          .map((p) => p.text ?? '')
+          .join('');
         if (textContent) text += `[User]\n${textContent}\n\n`;
         for (const part of content) {
           if (part.type === 'image_url') {
@@ -882,10 +1125,11 @@ function buildAcpBlocks(messages, tools, opts = {}) {
 function chunksToOpenAIMessage(chunks) {
   const textParts = [];
   const toolCallMap = new Map();
-  let promptTokens = 0, completionTokens = 0;
+  let promptTokens = 0,
+    completionTokens = 0;
 
   for (const c of chunks) {
-    if (c.kind === 'text')    textParts.push(c.text);
+    if (c.kind === 'text') textParts.push(c.text);
     if (c.kind === 'tool_call_start') {
       const key = c.toolCallId ?? `tc-${toolCallMap.size}`;
       toolCallMap.set(key, { id: makeToolCallId(), name: c.name ?? 'unknown', argsParts: [] });
@@ -895,7 +1139,7 @@ function chunksToOpenAIMessage(chunks) {
       if (tc && c.output) tc.argsParts.push(c.output);
     }
     if (c.kind === 'usage') {
-      promptTokens     = c.promptTokens     ?? promptTokens;
+      promptTokens = c.promptTokens ?? promptTokens;
       completionTokens = c.completionTokens ?? completionTokens;
     }
   }
@@ -904,11 +1148,15 @@ function chunksToOpenAIMessage(chunks) {
 
   let tool_calls = null;
   if (toolCallMap.size > 0) {
-    tool_calls = [...toolCallMap.values()].map(tc => {
+    tool_calls = [...toolCallMap.values()].map((tc) => {
       const raw = tc.argsParts.join('');
       let argsJson;
-      try { JSON.parse(raw); argsJson = raw || '{}'; }
-      catch { argsJson = '{}'; }
+      try {
+        JSON.parse(raw);
+        argsJson = raw || '{}';
+      } catch {
+        argsJson = '{}';
+      }
       return { id: tc.id, type: 'function', function: { name: tc.name, arguments: argsJson } };
     });
   }
@@ -919,23 +1167,25 @@ function chunksToOpenAIMessage(chunks) {
 function buildChatCompletion(id, model, content, tool_calls, promptTokens, completionTokens) {
   return {
     id,
-    object:  'chat.completion',
+    object: 'chat.completion',
     created: nowSec(),
     model,
-    choices: [{
-      index:   0,
-      message: {
-        role:    'assistant',
-        content: content || null,
-        ...(tool_calls ? { tool_calls } : {}),
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: content || null,
+          ...(tool_calls ? { tool_calls } : {}),
+        },
+        finish_reason: tool_calls?.length ? 'tool_calls' : 'stop',
+        logprobs: null,
       },
-      finish_reason: tool_calls?.length ? 'tool_calls' : 'stop',
-      logprobs: null,
-    }],
+    ],
     usage: {
-      prompt_tokens:     promptTokens,
+      prompt_tokens: promptTokens,
       completion_tokens: completionTokens,
-      total_tokens:      promptTokens + completionTokens,
+      total_tokens: promptTokens + completionTokens,
     },
   };
 }
@@ -943,7 +1193,7 @@ function buildChatCompletion(id, model, content, tool_calls, promptTokens, compl
 function makeDeltaChunk(id, model, delta, finish_reason = null) {
   return {
     id,
-    object:  'chat.completion.chunk',
+    object: 'chat.completion.chunk',
     created: nowSec(),
     model,
     choices: [{ index: 0, delta, finish_reason, logprobs: null }],
@@ -951,14 +1201,18 @@ function makeDeltaChunk(id, model, delta, finish_reason = null) {
 }
 
 function setSSEHeaders(res) {
-  res.setHeader('Content-Type',      'text/event-stream');
-  res.setHeader('Cache-Control',     'no-cache');
-  res.setHeader('Connection',        'keep-alive');
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
 }
 
-function sseData(obj) { return `data: ${JSON.stringify(obj)}\n\n`; }
-function sseDone()    { return 'data: [DONE]\n\n'; }
+function sseData(obj) {
+  return `data: ${JSON.stringify(obj)}\n\n`;
+}
+function sseDone() {
+  return 'data: [DONE]\n\n';
+}
 
 // ─── Tool call coercion ───────────────────────────────────────────────────────
 
@@ -981,11 +1235,15 @@ function coerceToolCall(message, tools) {
     const tc = parsed.tool_call;
     dbg('coerce', `tool_call wrapper → "${tc.name}"`);
     return {
-      ...message, content: '',
-      tool_calls: [{
-        id: makeToolCallId(), type: 'function',
-        function: { name: tc.name, arguments: JSON.stringify(tc.arguments ?? {}) },
-      }],
+      ...message,
+      content: '',
+      tool_calls: [
+        {
+          id: makeToolCallId(),
+          type: 'function',
+          function: { name: tc.name, arguments: JSON.stringify(tc.arguments ?? {}) },
+        },
+      ],
     };
   }
 
@@ -993,16 +1251,20 @@ function coerceToolCall(message, tools) {
     const tcFence = content.match(/```tool_call\s*\n(\w+)\(([\s\S]*?)\)\s*\n```/);
     if (tcFence) {
       const name = tcFence[1];
-      const tool = tools.find(t => (t.function?.name ?? t.name) === name);
+      const tool = tools.find((t) => (t.function?.name ?? t.name) === name);
       if (tool) {
         const args = parsePyFnCallArgs(tcFence[2], tool);
         dbg('coerce', `tool_call fence → "${name}"`);
         return {
-          ...message, content: '',
-          tool_calls: [{
-            id: makeToolCallId(), type: 'function',
-            function: { name, arguments: JSON.stringify(args) },
-          }],
+          ...message,
+          content: '',
+          tool_calls: [
+            {
+              id: makeToolCallId(),
+              type: 'function',
+              function: { name, arguments: JSON.stringify(args) },
+            },
+          ],
         };
       }
     }
@@ -1018,15 +1280,19 @@ function coerceToolCall(message, tools) {
         const kv = line.match(/^(\w+)\s*:\s*(.+)$/);
         if (kv) args[kv[1]] = isNaN(kv[2]) ? kv[2].trim() : Number(kv[2]);
       }
-      const tool = tools.find(t => (t.function?.name ?? t.name) === name);
+      const tool = tools.find((t) => (t.function?.name ?? t.name) === name);
       if (tool) {
         dbg('coerce', `natural language → tool_call "${name}"`);
         return {
-          ...message, content: '',
-          tool_calls: [{
-            id: makeToolCallId(), type: 'function',
-            function: { name, arguments: JSON.stringify(args) },
-          }],
+          ...message,
+          content: '',
+          tool_calls: [
+            {
+              id: makeToolCallId(),
+              type: 'function',
+              function: { name, arguments: JSON.stringify(args) },
+            },
+          ],
         };
       }
     }
@@ -1039,11 +1305,15 @@ function coerceToolCall(message, tools) {
   if (!name) return message;
   dbg('coerce', `plain JSON → tool_call "${name}"`);
   return {
-    ...message, content: '',
-    tool_calls: [{
-      id: makeToolCallId(), type: 'function',
-      function: { name, arguments: JSON.stringify(parsed) },
-    }],
+    ...message,
+    content: '',
+    tool_calls: [
+      {
+        id: makeToolCallId(),
+        type: 'function',
+        function: { name, arguments: JSON.stringify(parsed) },
+      },
+    ],
   };
 }
 
@@ -1051,12 +1321,20 @@ function coerceToolCall(message, tools) {
 
 const app = express();
 
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Authorization', 'Content-Type', 'X-Session-Id', 'X-Working-Dir', 'X-Request-Id'],
-  exposedHeaders: ['X-Request-Id'],
-}));
+app.use(
+  cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+    allowedHeaders: [
+      'Authorization',
+      'Content-Type',
+      'X-Session-Id',
+      'X-Working-Dir',
+      'X-Request-Id',
+    ],
+    exposedHeaders: ['X-Request-Id'],
+  }),
+);
 
 app.use(express.json({ limit: '8mb' }));
 
@@ -1073,12 +1351,14 @@ if (DEBUG) {
     // Log full request body to file for offline analysis
     if (_logStream && req.body) {
       const bodyStr = JSON.stringify(req.body);
-      _fileLine(`${ts()} [HTTP→] ${req.method} ${req.path}  rid=${req.id}  bytes=${bodyStr.length}  body=${bodyStr.length > 4000 ? bodyStr.slice(0, 4000) + '…' : bodyStr}`);
+      _fileLine(
+        `${ts()} [HTTP→] ${req.method} ${req.path}  rid=${req.id}  bytes=${bodyStr.length}  body=${bodyStr.length > 4000 ? bodyStr.slice(0, 4000) + '…' : bodyStr}`,
+      );
     }
     res.on('finish', () => {
       const model = req.body?.model ?? '-';
-      const dur   = Date.now() - t0;
-      const line  = `${req.method} ${req.path}  model=${model}  ${res.statusCode}  ${dur}ms  rid=${req.id}`;
+      const dur = Date.now() - t0;
+      const line = `${req.method} ${req.path}  model=${model}  ${res.statusCode}  ${dur}ms  rid=${req.id}`;
       log('req', line);
     });
     next();
@@ -1091,14 +1371,27 @@ app.use((req, res, next) => {
   if (DEBUG && req.path === '/debug/timings') return next();
 
   if (ALLOWED_IPS.length > 0) {
-    const ip = (req.headers['x-forwarded-for']?.split(',')[0] ?? req.socket.remoteAddress ?? '').replace('::ffff:', '');
-    if (!ALLOWED_IPS.includes(ip)) return apiError(res, 403, `IP ${ip} not in allowlist`, 'invalid_request_error');
+    const ip = (
+      req.headers['x-forwarded-for']?.split(',')[0] ??
+      req.socket.remoteAddress ??
+      ''
+    ).replace('::ffff:', '');
+    if (!ALLOWED_IPS.includes(ip))
+      return apiError(res, 403, `IP ${ip} not in allowlist`, 'invalid_request_error');
   }
 
   if (ACP_API_KEYS.length > 0) {
     const hdr = req.headers['authorization'] ?? '';
-    const m   = hdr.match(/^Bearer\s+(.+)$/i);
-    if (!m || !ACP_API_KEYS.includes(m[1])) return apiError(res, 401, 'Invalid or missing API key', 'invalid_request_error', null, 'invalid_api_key');
+    const m = hdr.match(/^Bearer\s+(.+)$/i);
+    if (!m || !ACP_API_KEYS.includes(m[1]))
+      return apiError(
+        res,
+        401,
+        'Invalid or missing API key',
+        'invalid_request_error',
+        null,
+        'invalid_api_key',
+      );
   }
 
   next();
@@ -1124,10 +1417,10 @@ if (DEBUG) {
 function modelsHandler(_, res) {
   res.json({
     object: 'list',
-    data: _startupModels.map(id => ({
+    data: _startupModels.map((id) => ({
       id,
-      object:   'model',
-      created:  nowSec(),
+      object: 'model',
+      created: nowSec(),
       owned_by: PROFILE.name,
     })),
   });
@@ -1147,17 +1440,18 @@ async function acquireTurn({ sessionId, cwd, clearContext, model, effort, marks 
       marks.t_acquired = process.hrtime.bigint();
       // Reset the thread for a new logical session (skip if just created — already fresh).
       if (clearContext && !created) await client.newSession(cwd, marks);
-      sessionState = created ? 'new' : (clearContext ? 'cleared' : 'reuse');
+      sessionState = created ? 'new' : clearContext ? 'cleared' : 'reuse';
     } else {
-      slot   = await pool.acquire();
+      slot = await pool.acquire();
       client = slot.client;
       marks.t_acquired = process.hrtime.bigint();
-      const reuse = POOL_PRECREATE && client.sessionId && !client._sessionConsumed && client.sessionCwd === cwd;
+      const reuse =
+        POOL_PRECREATE && client.sessionId && !client._sessionConsumed && client.sessionCwd === cwd;
       if (!reuse) await client.newSession(cwd, marks);
       client._sessionConsumed = true;
       sessionState = reuse ? 'reuse' : 'new';
     }
-    await client.setModel(model);
+    await client.setModel(resolveModel(model));
     await client.setReasoning(effort);
     marks.t_set_model = process.hrtime.bigint();
   } catch (err) {
@@ -1177,19 +1471,31 @@ function resolveEffort(value) {
   return (REASONING_EFFORTS.has(value) ? value : null) ?? REASONING_DEFAULT;
 }
 
+// Map the 'auto' selector to the backend's configured lean model so callers that
+// send model:'auto' don't land on the heaviest default. Backends with no concrete
+// models (kiro) leave 'auto' untouched (PROFILE.autoModel is null).
+function resolveModel(model) {
+  return model === 'auto' && PROFILE.autoModel ? PROFILE.autoModel : model;
+}
+
 // ── Responses API helpers ───────────────────────────────────────────────────────
 // Flatten the Responses `input` (string or array of input items) + optional
 // top-level `instructions` into chat-style messages we already know how to render.
 function responsesInputToMessages(input, instructions) {
   const messages = [];
   if (instructions) messages.push({ role: 'system', content: String(instructions) });
-  const partText = c => (typeof c === 'string' ? c : (c?.text ?? c?.input_text ?? ''));
-  const push = item => {
+  const partText = (c) => (typeof c === 'string' ? c : (c?.text ?? c?.input_text ?? ''));
+  const push = (item) => {
     if (item == null) return;
-    if (typeof item === 'string') { messages.push({ role: 'user', content: item }); return; }
+    if (typeof item === 'string') {
+      messages.push({ role: 'user', content: item });
+      return;
+    }
     if (item.type && item.type !== 'message') return; // skip function_call_output etc. (MVP)
     const role = item.role ?? 'user';
-    const content = Array.isArray(item.content) ? item.content.map(partText).join('') : partText(item.content);
+    const content = Array.isArray(item.content)
+      ? item.content.map(partText).join('')
+      : partText(item.content);
     if (content) messages.push({ role, content });
   };
   if (typeof input === 'string') messages.push({ role: 'user', content: input });
@@ -1201,8 +1507,15 @@ function responsesInputToMessages(input, instructions) {
 function responsesToolsToChat(tools) {
   if (!Array.isArray(tools) || !tools.length) return undefined;
   const mapped = tools
-    .filter(t => t?.type === 'function')
-    .map(t => ({ type: 'function', function: t.function ?? { name: t.name, description: t.description, parameters: t.parameters } }));
+    .filter((t) => t?.type === 'function')
+    .map((t) => ({
+      type: 'function',
+      function: t.function ?? {
+        name: t.name,
+        description: t.description,
+        parameters: t.parameters,
+      },
+    }));
   return mapped.length ? mapped : undefined;
 }
 
@@ -1210,20 +1523,34 @@ function buildResponsesObject(id, model, content, toolCalls, promptTokens, compl
   const output = [];
   for (const tc of toolCalls ?? []) {
     output.push({
-      type: 'function_call', status: 'completed',
+      type: 'function_call',
+      status: 'completed',
       id: `fc_${randomUUID().replace(/-/g, '').slice(0, 24)}`,
-      call_id: tc.id, name: tc.function.name, arguments: tc.function.arguments,
+      call_id: tc.id,
+      name: tc.function.name,
+      arguments: tc.function.arguments,
     });
   }
   output.push({
-    type: 'message', status: 'completed', role: 'assistant',
+    type: 'message',
+    status: 'completed',
+    role: 'assistant',
     id: `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`,
     content: [{ type: 'output_text', text: content ?? '', annotations: [] }],
   });
   return {
-    id, object: 'response', created_at: nowSec(), model, status: 'completed',
-    output, output_text: content ?? '',
-    usage: { input_tokens: promptTokens, output_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
+    id,
+    object: 'response',
+    created_at: nowSec(),
+    model,
+    status: 'completed',
+    output,
+    output_text: content ?? '',
+    usage: {
+      input_tokens: promptTokens,
+      output_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens,
+    },
   };
 }
 
@@ -1250,24 +1577,37 @@ app.post('/v1/chat/completions', async (req, res) => {
   const effort = resolveEffort(reasoning_effort);
 
   if (!Array.isArray(messages) || !messages.length) {
-    return apiError(res, 400, '`messages` is required and must be a non-empty array',
-      'invalid_request_error', 'messages');
+    return apiError(
+      res,
+      400,
+      '`messages` is required and must be a non-empty array',
+      'invalid_request_error',
+      'messages',
+    );
   }
 
-  const blocks    = buildAcpBlocks(messages, tools, { response_format, tool_choice });
-  const cwd       = req.headers['x-working-dir'] ?? pickCwd(blocks, CWD);
-  const sessionId = req.headers['x-session-id'] ?? (AUTO_SESSION_HASH ? autoSessionId(messages) : null);
+  const blocks = buildAcpBlocks(messages, tools, { response_format, tool_choice });
+  const cwd = req.headers['x-working-dir'] ?? pickCwd(blocks, CWD);
+  const sessionId =
+    req.headers['x-session-id'] ?? (AUTO_SESSION_HASH ? autoSessionId(messages) : null);
   // Logical-session boundary: clear conversation context on a persistent session
   // without tearing down the warm process (codex-acp has no /clear command, so we
   // reset by starting a fresh codex thread — session/new — on the same process).
   const clearContext = /^(1|true|reset|yes)$/i.test(req.headers['x-clear-context'] ?? '');
-  const id        = makeId();
+  const id = makeId();
 
   let client, release, slot, sessionState;
   const marks = { t_req_start: process.hrtime.bigint() };
 
   try {
-    ({ client, release, slot, sessionState } = await acquireTurn({ sessionId, cwd, clearContext, model, effort, marks }));
+    ({ client, release, slot, sessionState } = await acquireTurn({
+      sessionId,
+      cwd,
+      clearContext,
+      model,
+      effort,
+      marks,
+    }));
   } catch (err) {
     return apiError(res, 503, `ACP backend unavailable: ${err.message}`, 'api_error');
   }
@@ -1277,18 +1617,34 @@ app.post('/v1/chat/completions', async (req, res) => {
   let promptBlocks = blocks;
   const trimmedSystem = TRIM_SYSTEM_ON_REUSE && sessionId && sessionState === 'reuse';
   if (trimmedSystem) {
-    const trimmed = messages.filter(m => m.role !== 'system');
-    if (trimmed.length) promptBlocks = buildAcpBlocks(trimmed, tools, { response_format, tool_choice });
+    const trimmed = messages.filter((m) => m.role !== 'system');
+    if (trimmed.length)
+      promptBlocks = buildAcpBlocks(trimmed, tools, { response_format, tool_choice });
   }
 
-  const timingMeta = { rid: req.id, model, mode: PROFILE.mode, tools: !!tools?.length, stream,
-    session: trimmedSystem ? 'reuse-trim' : sessionState, promptChars: promptCharLen(promptBlocks), nMessages: messages.length, nTools: tools?.length ?? 0 };
+  const timingMeta = {
+    rid: req.id,
+    model,
+    mode: PROFILE.mode,
+    tools: !!tools?.length,
+    stream,
+    session: trimmedSystem ? 'reuse-trim' : sessionState,
+    promptChars: promptCharLen(promptBlocks),
+    nMessages: messages.length,
+    nTools: tools?.length ?? 0,
+  };
 
   // Timeout race
   let timedOut = false;
-  const timeoutPromise = MAX_EXEC_MS > 0
-    ? new Promise((_, reject) => setTimeout(() => { timedOut = true; reject(new Error('prompt_timeout')); }, MAX_EXEC_MS))
-    : new Promise(() => {});
+  const timeoutPromise =
+    MAX_EXEC_MS > 0
+      ? new Promise((_, reject) =>
+          setTimeout(() => {
+            timedOut = true;
+            reject(new Error('prompt_timeout'));
+          }, MAX_EXEC_MS),
+        )
+      : new Promise(() => {});
 
   try {
     if (stream) {
@@ -1297,8 +1653,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       // Role announcement delta
       res.write(sseData(makeDeltaChunk(id, model, { role: 'assistant', content: '' })));
 
-      const allChunks    = [];
-      let disconnected   = false;
+      const allChunks = [];
+      let disconnected = false;
       let releaseOnClose = null;
 
       req.on('close', async () => {
@@ -1311,20 +1667,24 @@ app.post('/v1/chat/completions', async (req, res) => {
       });
 
       const streamPromise = (async () => {
-        await client.prompt(promptBlocks, chunk => {
-          if (disconnected || timedOut) return;
-          allChunks.push(chunk);
-          if (!res.writable) return;
-          // When tools requested, buffer all output for coercion at end
-          if (tools?.length) return;
-          if (chunk.kind === 'text') {
-            res.write(sseData(makeDeltaChunk(id, model, { content: chunk.text })));
-          }
-        }, marks);
+        await client.prompt(
+          promptBlocks,
+          (chunk) => {
+            if (disconnected || timedOut) return;
+            allChunks.push(chunk);
+            if (!res.writable) return;
+            // When tools requested, buffer all output for coercion at end
+            if (tools?.length) return;
+            if (chunk.kind === 'text') {
+              res.write(sseData(makeDeltaChunk(id, model, { content: chunk.text })));
+            }
+          },
+          marks,
+        );
 
         if (disconnected || timedOut) return;
 
-        const raw     = chunksToOpenAIMessage(allChunks);
+        const raw = chunksToOpenAIMessage(allChunks);
         const message = coerceToolCall(raw, tools);
 
         // Flush buffered content when tools were present
@@ -1336,12 +1696,27 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (message.tool_calls?.length) {
           for (let i = 0; i < message.tool_calls.length; i++) {
             const tc = message.tool_calls[i];
-            res.write(sseData(makeDeltaChunk(id, model, {
-              tool_calls: [{ index: i, id: tc.id, type: 'function', function: { name: tc.function.name, arguments: '' } }],
-            })));
-            res.write(sseData(makeDeltaChunk(id, model, {
-              tool_calls: [{ index: i, function: { arguments: tc.function.arguments } }],
-            })));
+            res.write(
+              sseData(
+                makeDeltaChunk(id, model, {
+                  tool_calls: [
+                    {
+                      index: i,
+                      id: tc.id,
+                      type: 'function',
+                      function: { name: tc.function.name, arguments: '' },
+                    },
+                  ],
+                }),
+              ),
+            );
+            res.write(
+              sseData(
+                makeDeltaChunk(id, model, {
+                  tool_calls: [{ index: i, function: { arguments: tc.function.arguments } }],
+                }),
+              ),
+            );
           }
         }
 
@@ -1356,35 +1731,56 @@ app.post('/v1/chat/completions', async (req, res) => {
       await Promise.race([streamPromise, timeoutPromise]);
 
       if (!disconnected && !timedOut) recordTiming(marks, timingMeta, allChunks);
-
     } else {
       const promptPromise = client.prompt(promptBlocks, undefined, marks);
-      const chunks        = await Promise.race([promptPromise, timeoutPromise]);
+      const chunks = await Promise.race([promptPromise, timeoutPromise]);
 
       if (timedOut) {
         return apiError(res, 504, 'Request timed out', 'timeout', null, 'timeout');
       }
 
-      const raw     = chunksToOpenAIMessage(chunks);
+      const raw = chunksToOpenAIMessage(chunks);
       const message = coerceToolCall(raw, tools);
 
-      const timing           = recordTiming(marks, timingMeta, chunks);
-      const elapsed          = timing.total_ms ?? Number(process.hrtime.bigint() - marks.t_req_start) / 1e6;
-      const promptTxt        = promptBlocks.map(b => b.text ?? '').join('');
-      const promptTokens     = message.promptTokens     || estimateTokens(promptTxt);
+      const timing = recordTiming(marks, timingMeta, chunks);
+      const elapsed = timing.total_ms ?? Number(process.hrtime.bigint() - marks.t_req_start) / 1e6;
+      const promptTxt = promptBlocks.map((b) => b.text ?? '').join('');
+      const promptTokens = message.promptTokens || estimateTokens(promptTxt);
       const completionTokens = message.completionTokens || estimateTokens(message.content);
 
-      dbg('resp', `elapsed=${elapsed.toFixed(0)}ms  content=${JSON.stringify(message.content?.slice(0, 80))}  tool_calls=${JSON.stringify(message.tool_calls ?? null)}`);
+      dbg(
+        'resp',
+        `elapsed=${elapsed.toFixed(0)}ms  content=${JSON.stringify(message.content?.slice(0, 80))}  tool_calls=${JSON.stringify(message.tool_calls ?? null)}`,
+      );
 
-      res.json(buildChatCompletion(id, model, message.content, message.tool_calls, promptTokens, completionTokens));
+      res.json(
+        buildChatCompletion(
+          id,
+          model,
+          message.content,
+          message.tool_calls,
+          promptTokens,
+          completionTokens,
+        ),
+      );
     }
   } catch (err) {
     if (err.message === 'prompt_timeout' || timedOut) {
       await cancelWithGrace(client, 3000);
       if (!res.headersSent) {
-        return apiError(res, 504, `Request timed out after ${MAX_EXEC_MS}ms`, 'timeout', null, 'timeout');
+        return apiError(
+          res,
+          504,
+          `Request timed out after ${MAX_EXEC_MS}ms`,
+          'timeout',
+          null,
+          'timeout',
+        );
       }
-      if (stream && res.writable && !res.writableEnded) { res.write(sseDone()); res.end(); }
+      if (stream && res.writable && !res.writableEnded) {
+        res.write(sseDone());
+        res.end();
+      }
     } else {
       log('error', err.message);
       if (!res.headersSent) apiError(res, 500, err.message, 'api_error');
@@ -1414,34 +1810,63 @@ async function handleResponses(req, res) {
 
   const messages = responsesInputToMessages(input, instructions);
   if (!messages.length) {
-    return apiError(res, 400, '`input` is required and must be a string or a non-empty array', 'invalid_request_error', 'input');
+    return apiError(
+      res,
+      400,
+      '`input` is required and must be a string or a non-empty array',
+      'invalid_request_error',
+      'input',
+    );
   }
 
-  const tools     = responsesToolsToChat(respTools);
-  const effort    = resolveEffort(reasoning?.effort ?? reasoning_effort);
-  const blocks    = buildAcpBlocks(messages, tools, {});
-  const cwd       = req.headers['x-working-dir'] ?? pickCwd(blocks, CWD);
-  const sessionId = req.headers['x-session-id'] ?? (AUTO_SESSION_HASH ? autoSessionId(messages) : null);
+  const tools = responsesToolsToChat(respTools);
+  const effort = resolveEffort(reasoning?.effort ?? reasoning_effort);
+  const blocks = buildAcpBlocks(messages, tools, {});
+  const cwd = req.headers['x-working-dir'] ?? pickCwd(blocks, CWD);
+  const sessionId =
+    req.headers['x-session-id'] ?? (AUTO_SESSION_HASH ? autoSessionId(messages) : null);
   const clearContext = /^(1|true|reset|yes)$/i.test(req.headers['x-clear-context'] ?? '');
-  const id        = `resp_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+  const id = `resp_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
 
   let client, release, slot, sessionState;
   const marks = { t_req_start: process.hrtime.bigint() };
   try {
-    ({ client, release, slot, sessionState } = await acquireTurn({ sessionId, cwd, clearContext, model, effort, marks }));
+    ({ client, release, slot, sessionState } = await acquireTurn({
+      sessionId,
+      cwd,
+      clearContext,
+      model,
+      effort,
+      marks,
+    }));
   } catch (err) {
     return apiError(res, 503, `ACP backend unavailable: ${err.message}`, 'api_error');
   }
 
-  const timingMeta = { rid: req.id, model, mode: PROFILE.mode, tools: !!tools?.length, stream,
-    session: sessionState, promptChars: promptCharLen(blocks), nMessages: messages.length, nTools: tools?.length ?? 0 };
+  const timingMeta = {
+    rid: req.id,
+    model,
+    mode: PROFILE.mode,
+    tools: !!tools?.length,
+    stream,
+    session: sessionState,
+    promptChars: promptCharLen(blocks),
+    nMessages: messages.length,
+    nTools: tools?.length ?? 0,
+  };
   let timedOut = false;
-  const timeoutPromise = MAX_EXEC_MS > 0
-    ? new Promise((_, reject) => setTimeout(() => { timedOut = true; reject(new Error('prompt_timeout')); }, MAX_EXEC_MS))
-    : new Promise(() => {});
+  const timeoutPromise =
+    MAX_EXEC_MS > 0
+      ? new Promise((_, reject) =>
+          setTimeout(() => {
+            timedOut = true;
+            reject(new Error('prompt_timeout'));
+          }, MAX_EXEC_MS),
+        )
+      : new Promise(() => {});
 
   const tokens = (msg, text) => ({
-    pt: msg.promptTokens     || estimateTokens(blocks.map(b => b.text ?? '').join('')),
+    pt: msg.promptTokens || estimateTokens(blocks.map((b) => b.text ?? '').join('')),
     ct: msg.completionTokens || estimateTokens(text),
   });
 
@@ -1449,45 +1874,112 @@ async function handleResponses(req, res) {
     if (stream) {
       setSSEHeaders(res);
       let seq = 0;
-      const ev = (type, obj) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, sequence_number: seq++, ...obj })}\n\n`);
+      const ev = (type, obj) =>
+        res.write(
+          `event: ${type}\ndata: ${JSON.stringify({ type, sequence_number: seq++, ...obj })}\n\n`,
+        );
       const itemId = `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
-      const baseResp = status => ({ id, object: 'response', created_at: nowSec(), model, status, output: [], output_text: '' });
+      const baseResp = (status) => ({
+        id,
+        object: 'response',
+        created_at: nowSec(),
+        model,
+        status,
+        output: [],
+        output_text: '',
+      });
 
       ev('response.created', { response: baseResp('in_progress') });
       ev('response.in_progress', { response: baseResp('in_progress') });
-      ev('response.output_item.added', { output_index: 0, item: { type: 'message', id: itemId, status: 'in_progress', role: 'assistant', content: [] } });
-      ev('response.content_part.added', { item_id: itemId, output_index: 0, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } });
+      ev('response.output_item.added', {
+        output_index: 0,
+        item: {
+          type: 'message',
+          id: itemId,
+          status: 'in_progress',
+          role: 'assistant',
+          content: [],
+        },
+      });
+      ev('response.content_part.added', {
+        item_id: itemId,
+        output_index: 0,
+        content_index: 0,
+        part: { type: 'output_text', text: '', annotations: [] },
+      });
 
       const allChunks = [];
-      let disconnected = false, releaseOnClose = null;
+      let disconnected = false,
+        releaseOnClose = null;
       req.on('close', async () => {
-        if (!res.writableEnded) { disconnected = true; await cancelWithGrace(client, 3000); releaseOnClose?.(); releaseOnClose = null; }
+        if (!res.writableEnded) {
+          disconnected = true;
+          await cancelWithGrace(client, 3000);
+          releaseOnClose?.();
+          releaseOnClose = null;
+        }
       });
 
       const streamPromise = (async () => {
-        await client.prompt(blocks, chunk => {
-          if (disconnected || timedOut) return;
-          allChunks.push(chunk);
-          if (!res.writable || tools?.length) return;
-          if (chunk.kind === 'text') ev('response.output_text.delta', { item_id: itemId, output_index: 0, content_index: 0, delta: chunk.text });
-        }, marks);
+        await client.prompt(
+          blocks,
+          (chunk) => {
+            if (disconnected || timedOut) return;
+            allChunks.push(chunk);
+            if (!res.writable || tools?.length) return;
+            if (chunk.kind === 'text')
+              ev('response.output_text.delta', {
+                item_id: itemId,
+                output_index: 0,
+                content_index: 0,
+                delta: chunk.text,
+              });
+          },
+          marks,
+        );
         if (disconnected || timedOut) return;
 
         const message = coerceToolCall(chunksToOpenAIMessage(allChunks), tools);
-        const text    = message.content ?? '';
-        if (tools?.length && text) ev('response.output_text.delta', { item_id: itemId, output_index: 0, content_index: 0, delta: text });
-        ev('response.output_text.done',   { item_id: itemId, output_index: 0, content_index: 0, text });
-        ev('response.content_part.done',  { item_id: itemId, output_index: 0, content_index: 0, part: { type: 'output_text', text, annotations: [] } });
-        ev('response.output_item.done',   { output_index: 0, item: { type: 'message', id: itemId, status: 'completed', role: 'assistant', content: [{ type: 'output_text', text, annotations: [] }] } });
+        const text = message.content ?? '';
+        if (tools?.length && text)
+          ev('response.output_text.delta', {
+            item_id: itemId,
+            output_index: 0,
+            content_index: 0,
+            delta: text,
+          });
+        ev('response.output_text.done', {
+          item_id: itemId,
+          output_index: 0,
+          content_index: 0,
+          text,
+        });
+        ev('response.content_part.done', {
+          item_id: itemId,
+          output_index: 0,
+          content_index: 0,
+          part: { type: 'output_text', text, annotations: [] },
+        });
+        ev('response.output_item.done', {
+          output_index: 0,
+          item: {
+            type: 'message',
+            id: itemId,
+            status: 'completed',
+            role: 'assistant',
+            content: [{ type: 'output_text', text, annotations: [] }],
+          },
+        });
         const { pt, ct } = tokens(message, text);
-        ev('response.completed', { response: buildResponsesObject(id, model, text, message.tool_calls, pt, ct) });
+        ev('response.completed', {
+          response: buildResponsesObject(id, model, text, message.tool_calls, pt, ct),
+        });
         res.end();
       })();
 
       releaseOnClose = release;
       await Promise.race([streamPromise, timeoutPromise]);
       if (!disconnected && !timedOut) recordTiming(marks, timingMeta, allChunks);
-
     } else {
       const chunks = await Promise.race([client.prompt(blocks, undefined, marks), timeoutPromise]);
       if (timedOut) return apiError(res, 504, 'Request timed out', 'timeout', null, 'timeout');
@@ -1501,7 +1993,15 @@ async function handleResponses(req, res) {
   } catch (err) {
     if (err.message === 'prompt_timeout' || timedOut) {
       await cancelWithGrace(client, 3000);
-      if (!res.headersSent) return apiError(res, 504, `Request timed out after ${MAX_EXEC_MS}ms`, 'timeout', null, 'timeout');
+      if (!res.headersSent)
+        return apiError(
+          res,
+          504,
+          `Request timed out after ${MAX_EXEC_MS}ms`,
+          'timeout',
+          null,
+          'timeout',
+        );
       if (stream && res.writable && !res.writableEnded) res.end();
     } else {
       log('error', err.message);
@@ -1535,36 +2035,61 @@ try {
     const ids = slot.client.availableModels ?? [];
     if (ids.length) {
       _startupModels = PROFILE.formatStartupModels(ids);
-      log('startup', `discovered ${_startupModels.length} models from ${PROFILE.label}: ${_startupModels.join(', ')}`);
+      log(
+        'startup',
+        `discovered ${_startupModels.length} models from ${PROFILE.label}: ${_startupModels.join(', ')}`,
+      );
     } else {
-      log('startup', `session/new returned no model list — using fallback models (${_startupModels.join(', ')})`);
-      log('startup', `  (set DEBUG=1 to see the raw session/new response and verify the field path)`);
+      log(
+        'startup',
+        `session/new returned no model list — using fallback models (${_startupModels.join(', ')})`,
+      );
+      log(
+        'startup',
+        `  (set DEBUG=1 to see the raw session/new response and verify the field path)`,
+      );
     }
-  } finally { pool.release(slot); }
+  } finally {
+    pool.release(slot);
+  }
 } catch (e) {
-  log('startup', `model discovery failed (${e.message}) — using fallback models (${_startupModels.join(', ')})`);
+  log(
+    'startup',
+    `model discovery failed (${e.message}) — using fallback models (${_startupModels.join(', ')})`,
+  );
 }
 
 const server = app.listen(PORT, HOST, () => {
   if (_logStream) {
     // Dump redacted config to log file for debugging context
     const cfg = {
-      PORT, HOST, POOL_SIZE, SESSION_TTL_MS, MAX_EXEC_MS, PING_INTERVAL_MS,
-      backend: PROFILE.name, cmd: PROFILE.cmd, cwd: CWD.slice(0, 80),
-      mode: PROFILE.mode, defaultModel: PROFILE.defaultModel, fallbackModels: PROFILE.fallbackModels,
-      AUTO_SESSION_HASH, DEBUG,
+      PORT,
+      HOST,
+      POOL_SIZE,
+      SESSION_TTL_MS,
+      MAX_EXEC_MS,
+      PING_INTERVAL_MS,
+      backend: PROFILE.name,
+      cmd: PROFILE.cmd,
+      cwd: CWD.slice(0, 80),
+      mode: PROFILE.mode,
+      defaultModel: PROFILE.defaultModel,
+      fallbackModels: PROFILE.fallbackModels,
+      AUTO_SESSION_HASH,
+      DEBUG,
       ACP_API_KEY_SET: ACP_API_KEYS.length > 0,
       ALLOWED_IPS: ALLOWED_IPS,
-      OPENAI_API_KEY_SET: !!(process.env.OPENAI_API_KEY),
+      OPENAI_API_KEY_SET: !!process.env.OPENAI_API_KEY,
       models: _startupModels,
     };
     _logStream.write(`=== config ${JSON.stringify(cfg)} ===\n`);
   }
 
   const keyDisplay = ACP_API_KEYS.length
-    ? ACP_API_KEYS.map(t => `${t.slice(0, 18)}…`).join(', ')
+    ? ACP_API_KEYS.map((t) => `${t.slice(0, 18)}…`).join(', ')
     : 'OPEN (no ACP_API_KEY set)';
-  console.log(`
+  console.log(
+    `
 ┌─────────────────────────────────────────────────────────────┐
 │  ACP → OpenAI Proxy  v1.0  —  http://${HOST}:${PORT}
 │  Backend: ${PROFILE.name} (${PROFILE.cmd})
@@ -1574,10 +2099,11 @@ const server = app.listen(PORT, HOST, () => {
 │  Models:  ${_startupModels.join(', ')}
 │  TTL:     session=${SESSION_TTL_MS / 60000}min  exec_max=${MAX_EXEC_MS / 60000}min
 │  Session: ${AUTO_SESSION_HASH ? 'auto (system-prompt hash)' : 'stateless pool (set AUTO_SESSION_HASH=1 to persist)'}${_logPath ? `\n│  Log:     ${_logPath}` : ''}
-└─────────────────────────────────────────────────────────────┘`.trimStart());
+└─────────────────────────────────────────────────────────────┘`.trimStart(),
+  );
 });
 
-server.on('error', err => {
+server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
     console.error(`[start] Port ${PORT} already in use — is another instance running?`);
   } else {

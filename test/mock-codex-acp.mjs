@@ -18,7 +18,7 @@ const SCENARIO = process.env.MOCK_SCENARIO ?? 'DEFAULT';
 
 let sessionCounter = 0;
 let currentSessionId = null;
-let pendingPromptId = null;   // set in TIMEOUT scenario
+let pendingPromptId = null; // set in TIMEOUT scenario
 
 const rl = readline.createInterface({ input: process.stdin, terminal: false });
 
@@ -47,7 +47,7 @@ async function handlePrompt(id) {
     return; // wait for session/cancel to unblock
   }
   if (SCENARIO === 'SLOW') {
-    await new Promise(r => setTimeout(r, 300));
+    await new Promise((r) => setTimeout(r, 300));
   }
 
   if (SCENARIO === 'TOOL_CALL') {
@@ -80,11 +80,15 @@ async function handlePrompt(id) {
   ok(id);
 }
 
-rl.on('line', line => {
+rl.on('line', (line) => {
   line = line.trim();
   if (!line) return;
   let msg;
-  try { msg = JSON.parse(line); } catch { return; }
+  try {
+    msg = JSON.parse(line);
+  } catch {
+    return;
+  }
 
   const { id, method } = msg;
 
@@ -114,11 +118,7 @@ rl.on('line', line => {
       ok(id, {
         sessionId: currentSessionId,
         models: {
-          availableModels: [
-            { modelId: 'auto' },
-            { modelId: 'o4-mini' },
-            { modelId: 'gpt-4o' },
-          ],
+          availableModels: [{ modelId: 'auto' }, { modelId: 'o4-mini' }, { modelId: 'gpt-4o' }],
           currentModelId: 'auto',
         },
       });
@@ -134,7 +134,7 @@ rl.on('line', line => {
       break;
 
     case 'session/prompt':
-      handlePrompt(id).catch(e => rpcError(id, -32603, e.message));
+      handlePrompt(id).catch((e) => rpcError(id, -32603, e.message));
       break;
 
     default:

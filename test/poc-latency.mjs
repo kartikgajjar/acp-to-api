@@ -36,25 +36,32 @@ import readline from 'node:readline';
 import { randomUUID } from 'node:crypto';
 
 const BASE_URL = process.env.POC_BASE_URL ?? 'http://127.0.0.1:3456';
-const RUNS     = Number(process.env.POC_RUNS ?? 5);
-const MODEL    = process.env.POC_MODEL ?? 'auto';
-const TOKEN    = process.env.POC_TOKEN ?? '';
-const CODEX_CMD  = process.env.CODEX_CMD ?? 'codex-acp';
+const RUNS = Number(process.env.POC_RUNS ?? 5);
+const MODEL = process.env.POC_MODEL ?? 'auto';
+const TOKEN = process.env.POC_TOKEN ?? '';
+const CODEX_CMD = process.env.CODEX_CMD ?? 'codex-acp';
 const CODEX_ARGS = (process.env.CODEX_ARGS ?? '').split(' ').filter(Boolean);
 
-const argv  = process.argv.slice(2);
-const only  = argv.find(a => a === '--split' || a === '--probe' || a === '--ttft');
+const argv = process.argv.slice(2);
+const only = argv.find((a) => a === '--split' || a === '--probe' || a === '--ttft');
 const doSplit = only ? only === '--split' : true;
 const doProbe = only ? only === '--probe' : true;
-const doTtft  = only === '--ttft';
+const doTtft = only === '--ttft';
 
 const SPLIT_FIELDS = [
-  'acquire_ms', 'session_new_ms', 'set_mode_ms', 'set_model_ms',
-  'prefill_ms', 'thought_gap_ms', 'reasoning_gap_ms', 'gen_ms', 'total_ms',
+  'acquire_ms',
+  'session_new_ms',
+  'set_mode_ms',
+  'set_model_ms',
+  'prefill_ms',
+  'thought_gap_ms',
+  'reasoning_gap_ms',
+  'gen_ms',
+  'total_ms',
 ];
 
 function median(nums) {
-  const xs = nums.filter(n => typeof n === 'number' && !Number.isNaN(n)).sort((a, b) => a - b);
+  const xs = nums.filter((n) => typeof n === 'number' && !Number.isNaN(n)).sort((a, b) => a - b);
   if (!xs.length) return null;
   const mid = xs.length >> 1;
   return xs.length % 2 ? xs[mid] : (xs[mid - 1] + xs[mid]) / 2;
@@ -78,12 +85,18 @@ async function probeSplit() {
       const r = await fetch(`${BASE_URL}/v1/chat/completions`, {
         method: 'POST',
         headers: { ...headers, 'X-Request-Id': rid },
-        body: JSON.stringify({ model: MODEL, stream: false, messages: [{ role: 'user', content: 'say ok' }] }),
+        body: JSON.stringify({
+          model: MODEL,
+          stream: false,
+          messages: [{ role: 'user', content: 'say ok' }],
+        }),
       });
       const wall = Number(process.hrtime.bigint() - t0) / 1e6;
       const body = await r.json().catch(() => ({}));
-      const txt  = body?.choices?.[0]?.message?.content ?? '';
-      console.log(`  run ${i + 1}: ${r.status}  client_wall=${wall.toFixed(0)}ms  reply=${JSON.stringify(txt.slice(0, 40))}`);
+      const txt = body?.choices?.[0]?.message?.content ?? '';
+      console.log(
+        `  run ${i + 1}: ${r.status}  client_wall=${wall.toFixed(0)}ms  reply=${JSON.stringify(txt.slice(0, 40))}`,
+      );
     } catch (e) {
       console.log(`  run ${i + 1}: FAILED ${e.message}`);
     }
@@ -104,7 +117,7 @@ async function probeSplit() {
     return;
   }
 
-  const mine = timings.filter(t => rids.includes(t.rid));
+  const mine = timings.filter((t) => rids.includes(t.rid));
   const sample = mine.length ? mine : timings.slice(-RUNS);
   if (!sample.length) {
     console.log('\n  no timing records found.');
@@ -112,10 +125,10 @@ async function probeSplit() {
   }
 
   console.log(`\n  median split over ${sample.length} record(s):`);
-  const widest = Math.max(...SPLIT_FIELDS.map(f => f.length));
+  const widest = Math.max(...SPLIT_FIELDS.map((f) => f.length));
   let dominant = { field: null, ms: -1 };
   for (const f of SPLIT_FIELDS) {
-    const m = median(sample.map(t => t[f]));
+    const m = median(sample.map((t) => t[f]));
     const ms = m == null ? null : m;
     if (f !== 'total_ms' && ms != null && ms > dominant.ms) dominant = { field: f, ms };
     console.log(`    ${f.padEnd(widest)}  ${m == null ? '   -' : `${m.toFixed(1)}ms`}`);
@@ -141,14 +154,20 @@ async function probeTTFT() {
 
   const session = process.env.POC_SESSION || null; // fixed id → reuse one warm session
   if (session) console.log(`(stateful: reusing X-Session-Id=${session} across runs)`);
-  const ttfts = [], totals = [];
+  const ttfts = [],
+    totals = [];
   for (let i = 0; i < RUNS; i++) {
     const t0 = process.hrtime.bigint();
     let ttft = null;
     try {
       const r = await fetch(`${BASE_URL}/v1/chat/completions`, {
-        method: 'POST', headers: { ...headers, ...(session ? { 'X-Session-Id': session } : {}) },
-        body: JSON.stringify({ model: MODEL, stream: true, messages: [{ role: 'user', content: 'say ok' }] }),
+        method: 'POST',
+        headers: { ...headers, ...(session ? { 'X-Session-Id': session } : {}) },
+        body: JSON.stringify({
+          model: MODEL,
+          stream: true,
+          messages: [{ role: 'user', content: 'say ok' }],
+        }),
       });
       const reader = r.body.getReader();
       const dec = new TextDecoder();
@@ -157,24 +176,35 @@ async function probeTTFT() {
         const { value, done } = await reader.read();
         if (done) break;
         buf += dec.decode(value, { stream: true });
-        const lines = buf.split('\n'); buf = lines.pop();
+        const lines = buf.split('\n');
+        buf = lines.pop();
         for (const line of lines) {
           const t = line.trim();
           if (!t.startsWith('data: ') || t === 'data: [DONE]') continue;
           try {
             const delta = JSON.parse(t.slice(6))?.choices?.[0]?.delta?.content;
             if (delta && ttft == null) ttft = Number(process.hrtime.bigint() - t0) / 1e6;
-          } catch { /* keepalive */ }
+          } catch {
+            /* keepalive */
+          }
         }
       }
-    } catch (e) { console.log(`  run ${i + 1}: FAILED ${e.message}`); continue; }
+    } catch (e) {
+      console.log(`  run ${i + 1}: FAILED ${e.message}`);
+      continue;
+    }
     const total = Number(process.hrtime.bigint() - t0) / 1e6;
     if (ttft != null) ttfts.push(ttft);
     totals.push(total);
-    console.log(`  run ${i + 1}: ttft=${ttft == null ? 'n/a' : `${ttft.toFixed(0)}ms`}  total=${total.toFixed(0)}ms`);
+    console.log(
+      `  run ${i + 1}: ttft=${ttft == null ? 'n/a' : `${ttft.toFixed(0)}ms`}  total=${total.toFixed(0)}ms`,
+    );
   }
-  const mt = median(ttfts), mtot = median(totals);
-  console.log(`\n  median TTFT=${mt == null ? 'n/a' : `${mt.toFixed(0)}ms`}  median total=${mtot == null ? 'n/a' : `${mtot.toFixed(0)}ms`}`);
+  const mt = median(ttfts),
+    mtot = median(totals);
+  console.log(
+    `\n  median TTFT=${mt == null ? 'n/a' : `${mt.toFixed(0)}ms`}  median total=${mtot == null ? 'n/a' : `${mtot.toFixed(0)}ms`}`,
+  );
   if (mt != null) console.log(`  TTFT < 1000ms: ${mt < 1000 ? 'YES ✓' : 'NO ✗'}`);
 }
 
@@ -184,14 +214,24 @@ function makeRpcClient(proc) {
   const pending = new Map();
   let msgId = 0;
   const rl = readline.createInterface({ input: proc.stdout });
-  rl.on('line', line => {
+  rl.on('line', (line) => {
     line = line.trim();
     if (!line) return;
     let msg;
-    try { msg = JSON.parse(line); } catch { return; }
+    try {
+      msg = JSON.parse(line);
+    } catch {
+      return;
+    }
     // Auto-grant any permission prompt so probes never stall.
     if (msg.method === 'session/request_permission' && msg.id != null) {
-      proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { optionId: 'allow_always', granted: true } }) + '\n');
+      proc.stdin.write(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { optionId: 'allow_always', granted: true },
+        }) + '\n',
+      );
       return;
     }
     if (msg.id != null && pending.has(msg.id)) {
@@ -206,21 +246,35 @@ function makeRpcClient(proc) {
   }
   function request(method, params = {}, timeoutMs = 10000) {
     const id = ++msgId;
-    return new Promise(resolve => {
+    return new Promise((resolve) => {
       const timer = setTimeout(() => {
         pending.delete(id);
         resolve({ _timeout: true });
       }, timeoutMs);
-      pending.set(id, { resolve: msg => { clearTimeout(timer); resolve(msg); } });
+      pending.set(id, {
+        resolve: (msg) => {
+          clearTimeout(timer);
+          resolve(msg);
+        },
+      });
       proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
     });
   }
-  return { notify, request, close: () => { try { rl.close(); } catch {} } };
+  return {
+    notify,
+    request,
+    close: () => {
+      try {
+        rl.close();
+      } catch {}
+    },
+  };
 }
 
 function verdict(msg) {
   if (msg._timeout) return 'TIMEOUT';
-  if (msg.error) return `REJECT (${msg.error.code}${msg.error.message ? ` ${msg.error.message}` : ''})`;
+  if (msg.error)
+    return `REJECT (${msg.error.code}${msg.error.message ? ` ${msg.error.message}` : ''})`;
   return 'ACCEPT';
 }
 
@@ -235,9 +289,9 @@ async function probeCapabilities() {
     console.log(`  cannot spawn: ${e.message}`);
     return;
   }
-  proc.on('error', e => console.log(`  spawn error: ${e.message}`));
+  proc.on('error', (e) => console.log(`  spawn error: ${e.message}`));
   const stderr = [];
-  proc.stderr.on('data', d => stderr.push(String(d)));
+  proc.stderr.on('data', (d) => stderr.push(String(d)));
 
   const rpc = makeRpcClient(proc);
   try {
@@ -251,12 +305,18 @@ async function probeCapabilities() {
       if (stderr.length) console.log(`  stderr: ${stderr.join('').slice(0, 300)}`);
       return;
     }
-    if (init.error) { console.log(`  initialize REJECT: ${JSON.stringify(init.error)}`); return; }
+    if (init.error) {
+      console.log(`  initialize REJECT: ${JSON.stringify(init.error)}`);
+      return;
+    }
 
     rpc.notify('notifications/initialized');
 
     const sess = await rpc.request('session/new', { cwd: process.cwd(), mcpServers: [] });
-    if (sess._timeout || sess.error) { console.log(`  session/new failed: ${JSON.stringify(sess.error ?? 'timeout')}`); return; }
+    if (sess._timeout || sess.error) {
+      console.log(`  session/new failed: ${JSON.stringify(sess.error ?? 'timeout')}`);
+      return;
+    }
     const sessionId = sess.result?.sessionId ?? sess.result?.id;
     console.log(`  session: ${sessionId}`);
 
@@ -267,27 +327,39 @@ async function probeCapabilities() {
     // Per source, only config_id 'reasoning_effort' is dispatched; others → invalid_params.
     console.log('\n  session/set_config_option (reasoning-effort candidates):');
     const configIds = ['reasoning_effort', 'reasoning', 'effort', 'model_reasoning_effort'];
-    const values    = ['minimal', 'low', 'medium', 'high', 'none', 'xhigh'];
+    const values = ['minimal', 'low', 'medium', 'high', 'none', 'xhigh'];
     const envelopes = [
-      { name: 'bare',           wrap: v => v },
-      { name: 'value.value',    wrap: v => ({ value: v }) },
-      { name: 'value.valueId',  wrap: v => ({ valueId: v }) },
+      { name: 'bare', wrap: (v) => v },
+      { name: 'value.value', wrap: (v) => ({ value: v }) },
+      { name: 'value.valueId', wrap: (v) => ({ valueId: v }) },
     ];
     for (const configId of configIds) {
       let hit = null;
       for (const env of envelopes) {
-        const r = await rpc.request('session/set_config_option', { sessionId, configId, value: env.wrap('low') });
+        const r = await rpc.request('session/set_config_option', {
+          sessionId,
+          configId,
+          value: env.wrap('low'),
+        });
         const v = verdict(r);
-        process.stdout.write(`    ${configId.padEnd(22)} value=low(${env.name.padEnd(12)}) → ${v}\n`);
+        process.stdout.write(
+          `    ${configId.padEnd(22)} value=low(${env.name.padEnd(12)}) → ${v}\n`,
+        );
         if (v === 'ACCEPT' && !hit) hit = env;
       }
       if (hit) {
         const accepted = [];
         for (const value of values) {
-          const r = await rpc.request('session/set_config_option', { sessionId, configId, value: hit.wrap(value) });
+          const r = await rpc.request('session/set_config_option', {
+            sessionId,
+            configId,
+            value: hit.wrap(value),
+          });
           if (verdict(r) === 'ACCEPT') accepted.push(value);
         }
-        console.log(`      → working envelope: ${hit.name};  accepted values: ${accepted.join(', ') || '(none)'}`);
+        console.log(
+          `      → working envelope: ${hit.name};  accepted values: ${accepted.join(', ') || '(none)'}`,
+        );
       }
     }
 
@@ -300,8 +372,14 @@ async function probeCapabilities() {
     }
   } finally {
     rpc.close();
-    try { proc.kill('SIGTERM'); } catch {}
-    setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 1500).unref?.();
+    try {
+      proc.kill('SIGTERM');
+    } catch {}
+    setTimeout(() => {
+      try {
+        proc.kill('SIGKILL');
+      } catch {}
+    }, 1500).unref?.();
   }
 }
 

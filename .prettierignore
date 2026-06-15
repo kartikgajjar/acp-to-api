@@ -1,0 +1,8 @@
+# Build/runtime artifacts and reference dumps — never reformat
+node_modules/
+logs/
+tmp/
+*.log
+
+# Hand-authored docs (tables/layout) — keep verbatim
+*.md

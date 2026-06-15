@@ -1,26 +1,28 @@
 {
-	"name": "acp-openai-proxy",
-	"version": "3.0.0",
-	"type": "module",
-	"scripts": {
-		"start": "node acp-server-ollama.js",
-		"start:dev": "DEBUG=1 node acp-server-ollama.js",
-		"openai": "node acp-server-openai.js",
-		"openai:dev": "DEBUG=1 node acp-server-openai.js",
-		"codex": "node acp-server-openai.js",
-		"codex:dev": "DEBUG=1 node acp-server-openai.js",
-		"test": "node --test test/*.test.js",
-		"format": "biome format --write .",
-		"check": "biome check --write ."
-	},
-	"dependencies": {
-		"@zed-industries/codex-acp": "*",
-		"cors": "^2.8.5",
-		"dotenv": "^17.4.2",
-		"express": "^5.2.0",
-		"fastembed": "^2.1.0"
-	},
-	"devDependencies": {
-		"@biomejs/biome": "2.5.0"
-	}
+  "name": "acp-openai-proxy",
+  "version": "3.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node acp-server-ollama.js",
+    "start:dev": "DEBUG=1 node acp-server-ollama.js",
+    "openai": "node acp-server-openai.js",
+    "openai:dev": "DEBUG=1 node acp-server-openai.js",
+    "openai:appserver": "node acp-server-openai.js --backend=codex-appserver",
+    "openai:appserver:dev": "DEBUG=1 node acp-server-openai.js --backend=codex-appserver",
+    "codex": "node acp-server-openai.js",
+    "codex:dev": "DEBUG=1 node acp-server-openai.js",
+    "test": "node --test test/*.test.js",
+    "format": "prettier --write .",
+    "check": "prettier --check ."
+  },
+  "dependencies": {
+    "@zed-industries/codex-acp": "*",
+    "cors": "^2.8.5",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.0",
+    "fastembed": "^2.1.0"
+  },
+  "devDependencies": {
+    "prettier": "^3.6.2"
+  }
 }

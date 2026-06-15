@@ -13,7 +13,21 @@ Two standalone ACP-to-HTTP shims. **The file name = the REST interface it expose
 | `acp-server-ollama.js` | Ollama REST (`/api/chat`, `/api/tags`, embeddings, …) | 11434 | `kiro` |
 | `acp-server-openai.js` | OpenAI REST (`/v1/chat/completions`, `/v1/responses`, `/v1/models`) | 3456 | `codex` |
 
-**Backends** (`--backend=kiro|codex`): defined as a single `BACKENDS` map that is kept **byte-identical** in both files (a regression test enforces this — edit both copies together; markers `// >>> BACKENDS` … `// <<< BACKENDS`). The map is the source of truth for every per-backend quirk (spawn cmd/args, `notifications/initialized`, `session/set_mode`, model-switch method, notification parsing, debug filtering). A single `ACPSession` consumes the selected `PROFILE` with no backend `if`-branches.
+**Backends** (`--backend=kiro|codex|codex-appserver`): defined as a single `BACKENDS` map that is kept **byte-identical** in both files (a regression test enforces this — edit both copies together; markers `// >>> BACKENDS` … `// <<< BACKENDS`). The map is the source of truth for every per-backend quirk (spawn cmd/args, `notifications/initialized`, `session/set_mode`, model-switch method, notification parsing, debug filtering). `kiro` and `codex` are ACP backends consumed by a single `ACPSession` (no backend `if`-branches). `codex-appserver` speaks OpenAI's **native, non-ACP `codex app-server`** protocol and therefore uses its own session class — see below.
+
+### `codex-appserver` — native `codex app-server` backend
+
+A separate protocol family from ACP, so it lives in its own file `codex-appserver.js` (`AppServerSession` class + `makeAppServerProfile`) rather than in `ACPSession`. The BACKENDS entry only carries the fields the shared REST/pool/startup layers read plus a `SessionClass` pointer; pool/registry instantiate `PROFILE.SessionClass ?? ACPSession`. Key protocol differences (verified against codex-cli 0.139.0 via `codex app-server generate-ts`):
+
+- **Wire format "JSON-RPC lite"**: the `jsonrpc` field is omitted on the wire (in and out).
+- **Session = `thread/start`** → `result.thread.id` (used as our `sessionId`, so `X-Session-Id` / registry / `X-Clear-Context` work unchanged).
+- **Turn = `turn/start`** returns immediately (`result.turn.id`, `status:inProgress`); **completion is the async `turn/completed` notification** (`turn.status`), awaited via a per-turn `_turns` map keyed by turn id — not a blocking RPC.
+- **Per-turn model + reasoning effort** are fields on `turn/start` (not session-level), so `setModel`/`setReasoning` stash `_pendingModel`/`_pendingEffort` for the next turn.
+- **Cancel = `turn/interrupt {threadId, turnId}`** → `turn/completed{status:interrupted}`. `cancelWithGrace` (openai) drains on `_pending` **or** `_turns`.
+- **Streaming**: `item/agentMessage/delta` (text), `item/reasoning/*Delta` (thought), `thread/tokenUsage/updated` (`tokenUsage.last.{inputTokens,outputTokens}` → usage).
+- **Approvals** are server-initiated requests (`item/commandExecution/requestApproval`, `item/fileChange/requestApproval`) — auto-accepted (`{decision:'acceptForSession'}`).
+- **Auth** reuses the existing `codex login` (no API key); requires the `codex` CLI installed. `requiresAuthWhenRemote: true` (full-access → same remote-binding safety gate as `codex`).
+- **Coexistence**: `codex-appserver` is the forward path (official native protocol, no third-party dep); `codex` (codex-acp) is retained as a legacy fallback. Env: `CODEX_APPSERVER_{CMD,ARGS,MODE,MODEL_DEFAULT,AUTO_MODEL,AVAILABLE_MODELS}` (`AUTO_MODEL` default `gpt-5.4-mini` — what `model: "auto"` resolves to). On Windows the bare `codex` shim is spawned via shell; an explicit `.exe`/path (e.g. the test mock's node) is spawned directly.
 
 `acp-server-codex.js` is a **deprecated forwarding shim** for `acp-server-openai.js` (removed next release).
 
@@ -33,11 +47,12 @@ node acp-server-ollama.js --backend=codex   # Ollama surface over Codex (codex-a
 npm run openai                     # node acp-server-openai.js
 npm run openai:dev                 # DEBUG=1 node acp-server-openai.js
 node acp-server-openai.js --backend=kiro    # OpenAI surface over Kiro
+node acp-server-openai.js --backend=codex-appserver  # OpenAI surface over native codex app-server
 # `npm run codex` / `codex:dev` remain as deprecated aliases.
 
 npm test         # node --test test/*.test.js (regression + cross-backend, mock subprocess)
-npm run format   # biome format --write .
-npm run check    # biome check --write . (format + lint)
+npm run format   # prettier --write .
+npm run check    # prettier --check . (format verification)
 ```
 
 ### Backend selection & decoupled requirements
@@ -128,7 +143,8 @@ On startup, if `HOST ≠ 127.0.0.1/localhost` and `ACP_API_KEY` is empty and `AL
 | `CODEX_REASONING_EFFORT` | `low` | Default reasoning effort applied when a request omits `reasoning_effort`. `low` = low-TTFT default (codex-acp 0.16.0 rejects `minimal`/`none` for the default preset). Set empty to disable, or `medium`/`high`/`xhigh` for depth. Per-request `reasoning_effort` overrides. |
 | `CODEX_CMD` | `codex-acp` | Binary path — pin to version verified by spike |
 | `CODEX_MODE` | `full-access` | Permission mode |
-| `CODEX_MODEL_DEFAULT` | `gpt-5.5` | For lowest latency set a lean model (e.g. `gpt-5.4-mini`); quality default kept at `gpt-5.5` |
+| `CODEX_MODEL_DEFAULT` | `gpt-5.5` | Model used when a request **omits** `model`. Quality default kept at `gpt-5.5`. |
+| `CODEX_AUTO_MODEL` | `gpt-5.4-mini` | Model that the `model: "auto"` selector resolves to — a lean model so `auto` callers (e.g. Langflow) don't land on the heavy default. Set to `gpt-5.5`/`gpt-5.4` to change. `auto` resolution is via `resolveModel()` before `setModel`; kiro's `autoModel` is `null` so `auto` stays `auto`. Mirror: `CODEX_APPSERVER_AUTO_MODEL` for the app-server backend. |
 | `CODEX_AVAILABLE_MODELS` | `gpt-5.5,gpt-5.4,gpt-5.4-mini` | CSV for `/v1/models` |
 | `POOL_SIZE` | `4` | |
 | `POOL_PRECREATE` | `0` | `1` = pool pre-creates `session/new`+`set_mode` at warmup and recycles after each turn. **Situational/experimental**: real-binary benchmarks showed the recycle's `session/new` (~5 s) resurfaces as acquire-wait under back-to-back load, so it rarely helps net; the effective latency lever is **stateful session reuse** (see below). Only useful when `POOL_SIZE` ≫ peak concurrency. |
@@ -192,7 +208,7 @@ curl http://localhost:3456/v1/chat/completions \
 ```
 
 - `test/regression.test.js` — OpenAI-interface + codex-backend regression suite, using `test/mock-codex-acp.mjs` as `CODEX_ARGS`. Includes the `POOL_PRECREATE` reuse/recycle behavior.
-- `test/cross-backend.test.js` — the 2×2 interface×backend matrix against the recording mock `test/mock-acp.mjs`: asserts each backend's protocol (initialized / set_mode / set_model vs set_config_option), `reasoning_effort` forwarding (codex maps it, kiro no-ops), that tool-arg format tracks the interface, the backend-following safety gate, auth enforcement, `--backend` parsing, the deprecated shim boot, and the `BACKENDS` byte-identity guard.
+- `test/cross-backend.test.js` — the 2×2 interface×backend matrix against the recording mock `test/mock-acp.mjs`: asserts each backend's protocol (initialized / set_mode / set_model vs set_config_option), `reasoning_effort` forwarding (codex maps it, kiro no-ops), that tool-arg format tracks the interface, the backend-following safety gate, auth enforcement, `--backend` parsing, the deprecated shim boot, and the `BACKENDS` byte-identity guard. A separate `codex-appserver` block drives the native app-server mock `test/mock-codex-appserver.mjs` (no `jsonrpc` header): asserts `thread/start`, per-turn model + effort on `turn/start`, `turn/completed` completion + streamed-text assembly, `tokenUsage` → usage, `X-Clear-Context` → fresh thread, `MAX_EXEC_MS` timeout → `turn/interrupt` + 504, and the remote safety gate.
 
 ### Latency instrumentation
 
@@ -209,4 +225,4 @@ When `DEBUG=1`, each request emits a `[DBG:timing]` JSON line, a one-line `[perf
 - Auth: `ACP_API_KEY` (openai interface) / `AUTH_TOKEN` (ollama interface), comma-separated bearer tokens. `/health` and `/` are always unauthenticated.
 - Errors: OpenAI-envelope `{ error: { message, type, param, code } }` in the openai server; `{ error: <string> }` Ollama format in the ollama server.
 - No build step — plain ESM (`"type": "module"`), Node 18+.
-- Biome (`biome.json`) — tabs, single quotes. Run `npm run check` before committing.
+- Prettier (`.prettierrc`) — 2-space, single quotes, semicolons, `printWidth: 100`; Markdown is excluded (`.prettierignore`) to preserve hand-built tables. Run `npm run check` before committing (`npm run format` to apply). Replaced Biome, whose `indentStyle: tab` did not match the source.

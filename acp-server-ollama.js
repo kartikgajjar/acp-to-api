@@ -44,11 +44,13 @@ import readline from 'readline';
 import { EventEmitter } from 'events';
 import { randomUUID, createHash } from 'crypto';
 import path from 'path';
+// Native `codex app-server` backend (non-ACP protocol) — separate session class.
+import { makeAppServerProfile, AppServerSession } from './codex-appserver.js';
 
 // fastembed is an OPTIONAL peer dependency — loaded lazily so the server can run
 // (chat/generate over any backend) even when it isn't installed. The embeddings
 // endpoints return 503 when it's absent.
-let _fastembed   = null;
+let _fastembed = null;
 let _fastembedErr = null;
 async function loadFastembed() {
   if (_fastembed) return _fastembed;
@@ -65,20 +67,26 @@ async function loadFastembed() {
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const PORT             = parseInt(process.env.PORT             ?? '11434');
-const HOST             = process.env.HOST                      ?? '0.0.0.0';
-const ALLOW_INSECURE   = process.env.ALLOW_INSECURE_REMOTE     === '1';
-const CWD              = process.env.ACP_CWD ?? process.env.KIRO_CWD ?? process.env.CODEX_CWD ?? process.cwd();
-const DEBUG            = process.env.DEBUG                     === '1';
+const PORT = parseInt(process.env.PORT ?? '11434');
+const HOST = process.env.HOST ?? '0.0.0.0';
+const ALLOW_INSECURE = process.env.ALLOW_INSECURE_REMOTE === '1';
+const CWD = process.env.ACP_CWD ?? process.env.KIRO_CWD ?? process.env.CODEX_CWD ?? process.cwd();
+const DEBUG = process.env.DEBUG === '1';
 
-const POOL_SIZE        = parseInt(process.env.POOL_SIZE        ?? '4');
-const POOL_PRECREATE   = process.env.POOL_PRECREATE           === '1';
-const SESSION_TTL_MS   = parseInt(process.env.SESSION_TTL_MS   ?? String(30 * 60 * 1000));
-const PING_INTERVAL_MS = parseInt(process.env.PING_INTERVAL    ?? '60000');
-const MAX_EXEC_MS      = parseInt(process.env.MAX_EXEC_MS      ?? String(10 * 60 * 1000));
+const POOL_SIZE = parseInt(process.env.POOL_SIZE ?? '4');
+const POOL_PRECREATE = process.env.POOL_PRECREATE === '1';
+const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS ?? String(30 * 60 * 1000));
+const PING_INTERVAL_MS = parseInt(process.env.PING_INTERVAL ?? '60000');
+const MAX_EXEC_MS = parseInt(process.env.MAX_EXEC_MS ?? String(10 * 60 * 1000));
 
-const AUTH_TOKENS = (process.env.AUTH_TOKEN ?? '').split(',').map(t => t.trim()).filter(Boolean);
-const ALLOWED_IPS = (process.env.ALLOWED_IPS ?? '').split(',').map(t => t.trim()).filter(Boolean);
+const AUTH_TOKENS = (process.env.AUTH_TOKEN ?? '')
+  .split(',')
+  .map((t) => t.trim())
+  .filter(Boolean);
+const ALLOWED_IPS = (process.env.ALLOWED_IPS ?? '')
+  .split(',')
+  .map((t) => t.trim())
+  .filter(Boolean);
 
 // When AUTO_SESSION_HASH=1, requests without x-session-id are routed to a persistent session
 // derived from the system-prompt hash. This preserves conversation context across turns for
@@ -94,22 +102,30 @@ const AUTO_SESSION_HASH = process.env.AUTO_SESSION_HASH === '1';
 // >>> BACKENDS
 const BACKENDS = {
   kiro: (env) => ({
-    name:  'kiro',
+    name: 'kiro',
     label: 'kiro-cli',
-    cmd:   env.KIRO_CMD ?? 'kiro-cli',
-    args:  (env.KIRO_ARGS ?? 'acp').split(' ').filter(Boolean),
+    cmd: env.KIRO_CMD ?? 'kiro-cli',
+    args: (env.KIRO_ARGS ?? 'acp').split(' ').filter(Boolean),
     clientName: 'acp-proxy',
     requiresAuthWhenRemote: false,
     sendInitialized: false,
     mode: null,
     defaultModel: 'auto',
+    autoModel: null, // no concrete models — 'auto' stays 'auto'
     fallbackModels: ['auto'],
-    buildEnv(parent) { return { ...parent }; },
-    formatStartupModels(ids) { return ['auto', ...ids.filter(id => id !== 'auto')]; },
+    buildEnv(parent) {
+      return { ...parent };
+    },
+    formatStartupModels(ids) {
+      return ['auto', ...ids.filter((id) => id !== 'auto')];
+    },
     async postNewSession() {},
     async setModel(session, modelId) {
       if (!modelId || modelId === 'auto' || modelId === session.currentModel) return;
-      await session._reqSafe('model', 'session/set_model', { sessionId: session.sessionId, modelId });
+      await session._reqSafe('model', 'session/set_model', {
+        sessionId: session.sessionId,
+        modelId,
+      });
       session.currentModel = modelId;
     },
     async setReasoning() {},
@@ -136,15 +152,21 @@ const BACKENDS = {
           return out ? { kind: 'thought', text: out } : null;
         }
         case 'plan': {
-          const entries = (u.entries ?? []).map(e => e.content ?? e).join('\n');
+          const entries = (u.entries ?? []).map((e) => e.content ?? e).join('\n');
           return entries ? { kind: 'plan', text: entries } : null;
         }
-        default: return { kind: 'unhandled', type };
+        default:
+          return { kind: 'unhandled', type };
       }
     },
     dbgSkip(msg) {
       const m = msg.method;
-      if (m === 'session/update' || m === 'session/notification' || m === '_kiro.dev/session/update') return 'skip';
+      if (
+        m === 'session/update' ||
+        m === 'session/notification' ||
+        m === '_kiro.dev/session/update'
+      )
+        return 'skip';
       if (m === '_kiro.dev/commands/available') return 'commands';
       if (m === '_kiro.dev/subagent/list_update') return 'skip';
       if (!m && msg.error?.data === 'ping') return 'skip';
@@ -152,34 +174,52 @@ const BACKENDS = {
     },
   }),
   codex: (env) => ({
-    name:  'codex',
+    name: 'codex',
     label: 'codex-acp',
-    cmd:   env.CODEX_CMD ?? 'codex-acp',
-    args:  (env.CODEX_ARGS ?? '').split(' ').filter(Boolean),
+    cmd: env.CODEX_CMD ?? 'codex-acp',
+    args: (env.CODEX_ARGS ?? '').split(' ').filter(Boolean),
     clientName: 'acp-proxy',
     requiresAuthWhenRemote: true,
     sendInitialized: true,
     mode: env.CODEX_MODE ?? 'full-access',
     defaultModel: env.CODEX_MODEL_DEFAULT ?? 'gpt-5.5',
-    fallbackModels: (env.CODEX_AVAILABLE_MODELS ?? 'gpt-5.5,gpt-5.4,gpt-5.4-mini').split(',').map(s => s.trim()).filter(Boolean),
+    // 'auto' resolves to this lean model instead of the heavy default (low latency).
+    autoModel: env.CODEX_AUTO_MODEL ?? 'gpt-5.4-mini',
+    fallbackModels: (env.CODEX_AVAILABLE_MODELS ?? 'gpt-5.5,gpt-5.4,gpt-5.4-mini')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
     buildEnv(parent) {
       // codex-acp authenticates via codex's own login over ACP; OPENAI_API_KEY is
       // optional and passed through only when present (API-key auth). Not required.
       return { ...parent };
     },
-    formatStartupModels(ids) { return [...new Set(ids)]; },
+    formatStartupModels(ids) {
+      return [...new Set(ids)];
+    },
     async postNewSession(session) {
       if (!session.sessionId || !this.mode) return;
-      await session._reqSafe('mode', 'session/set_mode', { sessionId: session.sessionId, modeId: this.mode });
+      await session._reqSafe('mode', 'session/set_mode', {
+        sessionId: session.sessionId,
+        modeId: this.mode,
+      });
     },
     async setModel(session, modelId) {
       if (!modelId || modelId === 'auto' || modelId === session.currentModel) return;
-      await session._reqSafe('model', 'session/set_config_option', { sessionId: session.sessionId, configId: 'model', value: modelId });
+      await session._reqSafe('model', 'session/set_config_option', {
+        sessionId: session.sessionId,
+        configId: 'model',
+        value: modelId,
+      });
       session.currentModel = modelId;
     },
     async setReasoning(session, effort) {
       if (!effort) return;
-      await session._reqSafe('reasoning', 'session/set_config_option', { sessionId: session.sessionId, configId: 'reasoning_effort', value: effort });
+      await session._reqSafe('reasoning', 'session/set_config_option', {
+        sessionId: session.sessionId,
+        configId: 'reasoning_effort',
+        value: effort,
+      });
     },
     updateMethods: new Set(['session/update', 'session/notification']),
     parseUpdate(params) {
@@ -187,24 +227,44 @@ const BACKENDS = {
       let type = u.sessionUpdate ?? u.type ?? '';
       let payload = u;
       if (!type) {
-        const keys = Object.keys(u).filter(k => k !== 'sessionId');
-        if (keys.length >= 1) { type = keys[0]; payload = u[type] ?? u; }
+        const keys = Object.keys(u).filter((k) => k !== 'sessionId');
+        if (keys.length >= 1) {
+          type = keys[0];
+          payload = u[type] ?? u;
+        }
       }
       switch (type) {
         case 'agent_message_chunk':
         case 'AgentMessageChunk': {
-          const text = payload.content?.text ?? payload.content ?? payload.text ?? u.content?.text ?? u.content ?? u.text ?? '';
+          const text =
+            payload.content?.text ??
+            payload.content ??
+            payload.text ??
+            u.content?.text ??
+            u.content ??
+            u.text ??
+            '';
           return text ? { kind: 'text', text } : null;
         }
         case 'agent_thought_chunk':
         case 'AgentThoughtChunk': {
-          const text = payload.content?.text ?? payload.content ?? payload.text ?? u.content?.text ?? u.content ?? u.text ?? '';
+          const text =
+            payload.content?.text ??
+            payload.content ??
+            payload.text ??
+            u.content?.text ??
+            u.content ??
+            u.text ??
+            '';
           return text ? { kind: 'thought', text } : null;
         }
         case 'tool_call':
         case 'tool_call_chunk':
         case 'ToolCall':
-          return { kind: 'thought', text: `[tool: ${payload.title ?? payload.name ?? u.title ?? u.name ?? 'unknown'}]\n` };
+          return {
+            kind: 'thought',
+            text: `[tool: ${payload.title ?? payload.name ?? u.title ?? u.name ?? 'unknown'}]\n`,
+          };
         case 'tool_call_update':
         case 'ToolCallUpdate': {
           const out = payload.output ?? payload.content?.text ?? u.output ?? u.content?.text;
@@ -212,16 +272,24 @@ const BACKENDS = {
         }
         case 'plan':
         case 'Plan': {
-          const entries = (payload.entries ?? u.entries ?? []).map(e => e.content ?? e).join('\n');
+          const entries = (payload.entries ?? u.entries ?? [])
+            .map((e) => e.content ?? e)
+            .join('\n');
           return entries ? { kind: 'plan', text: entries } : null;
         }
         case 'UsageUpdate':
         case 'usage_update': {
-          const pt = payload.promptTokens ?? payload.prompt_tokens ?? u.promptTokens ?? u.prompt_tokens;
-          const ct = payload.completionTokens ?? payload.completion_tokens ?? u.completionTokens ?? u.completion_tokens;
+          const pt =
+            payload.promptTokens ?? payload.prompt_tokens ?? u.promptTokens ?? u.prompt_tokens;
+          const ct =
+            payload.completionTokens ??
+            payload.completion_tokens ??
+            u.completionTokens ??
+            u.completion_tokens;
           return pt != null ? { kind: 'usage', promptTokens: pt, completionTokens: ct ?? 0 } : null;
         }
-        default: return { kind: 'unhandled', type };
+        default:
+          return { kind: 'unhandled', type };
       }
     },
     dbgSkip(msg) {
@@ -231,21 +299,38 @@ const BACKENDS = {
       return null;
     },
   }),
+  // Native `codex app-server` (non-ACP). The profile carries only the fields the
+  // shared REST/pool/startup layers read; AppServerSession (SessionClass) owns the
+  // protocol. pool/registry instantiate PROFILE.SessionClass ?? ACPSession.
+  'codex-appserver': (env) => ({
+    ...makeAppServerProfile(env),
+    SessionClass: AppServerSession,
+  }),
 };
 // <<< BACKENDS
 
 const DEFAULT_BACKEND = 'kiro';
-const _backendArg  = process.argv.find(a => a.startsWith('--backend='))?.split('=')[1];
-const BACKEND_NAME = ((_backendArg ?? '').trim().toLowerCase()) || DEFAULT_BACKEND;
+const _backendArg = process.argv.find((a) => a.startsWith('--backend='))?.split('=')[1];
+const BACKEND_NAME = (_backendArg ?? '').trim().toLowerCase() || DEFAULT_BACKEND;
 if (!BACKENDS[BACKEND_NAME]) {
-  console.error(`[startup] ERROR: unknown --backend="${BACKEND_NAME}" (expected: ${Object.keys(BACKENDS).join('|')})`);
+  console.error(
+    `[startup] ERROR: unknown --backend="${BACKEND_NAME}" (expected: ${Object.keys(BACKENDS).join('|')})`,
+  );
   process.exit(1);
 }
 const PROFILE = BACKENDS[BACKEND_NAME](process.env);
 
 // Remote binding safety gate — a full-access backend must have auth when not on localhost
-if (PROFILE.requiresAuthWhenRemote && HOST !== '127.0.0.1' && HOST !== 'localhost' && AUTH_TOKENS.length === 0 && !ALLOW_INSECURE) {
-  console.error(`[startup] ERROR: HOST=${HOST} with no AUTH_TOKEN is unsafe for the ${PROFILE.name} backend (full-access agent).`);
+if (
+  PROFILE.requiresAuthWhenRemote &&
+  HOST !== '127.0.0.1' &&
+  HOST !== 'localhost' &&
+  AUTH_TOKENS.length === 0 &&
+  !ALLOW_INSECURE
+) {
+  console.error(
+    `[startup] ERROR: HOST=${HOST} with no AUTH_TOKEN is unsafe for the ${PROFILE.name} backend (full-access agent).`,
+  );
   console.error(`[startup] Set AUTH_TOKEN or set ALLOW_INSECURE_REMOTE=1 to override.`);
   process.exit(1);
 }
@@ -265,29 +350,67 @@ function _detectGPUProviders() {
   }
 }
 
-const EMBEDDING_PROVIDERS     = process.env.EMBEDDING_PROVIDERS
-                                   ? process.env.EMBEDDING_PROVIDERS.split(',').map(t => t.trim()).filter(Boolean)
-                                   : _detectGPUProviders();
-const _hasGPU                 = EMBEDDING_PROVIDERS.some(p => p !== 'cpu' && p !== 'wasm' && p !== 'xnnpack' && p !== 'webgl');
-const EMBEDDING_MODEL_DEFAULT = process.env.EMBEDDING_MODEL_DEFAULT ?? (_hasGPU ? 'BGEBaseENV15' : 'BGESmallENV15');
+const EMBEDDING_PROVIDERS = process.env.EMBEDDING_PROVIDERS
+  ? process.env.EMBEDDING_PROVIDERS.split(',')
+      .map((t) => t.trim())
+      .filter(Boolean)
+  : _detectGPUProviders();
+const _hasGPU = EMBEDDING_PROVIDERS.some(
+  (p) => p !== 'cpu' && p !== 'wasm' && p !== 'xnnpack' && p !== 'webgl',
+);
+const EMBEDDING_MODEL_DEFAULT =
+  process.env.EMBEDDING_MODEL_DEFAULT ?? (_hasGPU ? 'BGEBaseENV15' : 'BGESmallENV15');
 const EMBEDDING_MODELS_ENABLED = (process.env.EMBEDDING_MODELS_ENABLED ?? EMBEDDING_MODEL_DEFAULT)
-                                   .split(',').map(t => t.trim()).filter(Boolean);
-const EMBEDDING_CACHE_DIR      = process.env.EMBEDDING_CACHE_DIR      ?? undefined;
-const EMBEDDING_BATCH_SIZE     = parseInt(process.env.EMBEDDING_BATCH_SIZE ?? '32');
-const EMBEDDING_MAX_INPUTS     = parseInt(process.env.EMBEDDING_MAX_INPUTS ?? '2048');
+  .split(',')
+  .map((t) => t.trim())
+  .filter(Boolean);
+const EMBEDDING_CACHE_DIR = process.env.EMBEDDING_CACHE_DIR ?? undefined;
+const EMBEDDING_BATCH_SIZE = parseInt(process.env.EMBEDDING_BATCH_SIZE ?? '32');
+const EMBEDDING_MAX_INPUTS = parseInt(process.env.EMBEDDING_MAX_INPUTS ?? '2048');
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
 
-function ts() { return new Date().toISOString().replace(/(\.\d{3})Z$/, (_, ms) => ms + '000Z'); }
-function log(tag, ...args) { console.log(`${ts()} [${tag}]`, ...args); }
-function dbg(tag, ...args) { if (DEBUG) process.stderr.write(`${ts()} [${tag}] ${args.join(' ')}\n`); }
+// Log-line timestamp in US Pacific wall-clock time (auto PST/PDT label). Only the
+// log prefix is localized — API response fields elsewhere stay UTC ISO 8601.
+function ts() {
+  const d = new Date();
+  const p = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+    timeZoneName: 'short',
+  })
+    .formatToParts(d)
+    .reduce((a, x) => ((a[x.type] = x.value), a), {});
+  const ms = String(d.getMilliseconds()).padStart(3, '0');
+  return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}:${p.second}.${ms}000 ${p.timeZoneName}`;
+}
+function log(tag, ...args) {
+  console.log(`${ts()} [${tag}]`, ...args);
+}
+function dbg(tag, ...args) {
+  if (DEBUG) process.stderr.write(`${ts()} [${tag}] ${args.join(' ')}\n`);
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function makeId()         { return `chatcmpl-${randomUUID().replace(/-/g, '').slice(0, 24)}`; }
-function makeToolCallId() { return `call_${randomUUID().replace(/-/g, '').slice(0, 16)}`; }
-function makeReqId()      { return `req_${randomUUID().replace(/-/g, '').slice(0, 24)}`; }
-function nowSec()         { return Math.floor(Date.now() / 1000); }
+function makeId() {
+  return `chatcmpl-${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+}
+function makeToolCallId() {
+  return `call_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
+}
+function makeReqId() {
+  return `req_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+}
+function nowSec() {
+  return Math.floor(Date.now() / 1000);
+}
 
 // Reasoning effort: codex maps these to ReasoningEffort (no-op for kiro). The Ollama
 // `think` field, when a level string, selects the effort; otherwise CODEX_REASONING_EFFORT
@@ -300,6 +423,13 @@ function reasoningFrom(think) {
   return REASONING_EFFORTS.has(think) ? think : REASONING_DEFAULT;
 }
 
+// Map the 'auto' selector to the backend's configured lean model so callers that
+// send model:'auto' don't land on the heaviest default. Backends with no concrete
+// models (kiro) leave 'auto' untouched (PROFILE.autoModel is null).
+function resolveModel(model) {
+  return model === 'auto' && PROFILE.autoModel ? PROFILE.autoModel : model;
+}
+
 // ─── Latency instrumentation ──────────────────────────────────────────────────
 // process.hrtime.bigint() stamps threaded via a `marks` object; recordTiming() turns
 // them into a machine-readable per-request split, surfaced at GET /debug/timings (DEBUG).
@@ -310,37 +440,47 @@ const _timings = [];
 const _TIMINGS_MAX = 200;
 function recordTiming(marks, meta, chunks) {
   const m = marks;
-  let nText = 0, nThought = 0, replyChars = 0;
+  let nText = 0,
+    nThought = 0,
+    replyChars = 0;
   for (const c of chunks ?? []) {
-    if (c.kind === 'text') { nText++; replyChars += c.text?.length ?? 0; }
-    else if (c.kind === 'thought') nThought++;
+    if (c.kind === 'text') {
+      nText++;
+      replyChars += c.text?.length ?? 0;
+    } else if (c.kind === 'thought') nThought++;
   }
   const rec = {
-    rid: meta.rid, model: meta.model, tools: meta.tools, stream: meta.stream,
+    rid: meta.rid,
+    model: meta.model,
+    tools: meta.tools,
+    stream: meta.stream,
     session: meta.session ?? null,
-    prompt_chars:      meta.promptChars ?? null,
+    prompt_chars: meta.promptChars ?? null,
     prompt_tokens_est: meta.promptChars != null ? Math.ceil(meta.promptChars / 4) : null,
-    n_messages:        meta.nMessages ?? null,
-    n_tools:           meta.nTools ?? null,
-    acquire_ms:       _ns2ms(m.t_req_start, m.t_acquired),
-    session_new_ms:   _ns2ms(m.t_acquired, m.t_session_created),
-    set_mode_ms:      _ns2ms(m.t_session_created, m.t_post_session),
-    set_model_ms:     _ns2ms(m.t_post_session ?? m.t_acquired, m.t_set_model),
-    prefill_ms:       _ns2ms(m.t_prompt_sent, m.t_first_update),
-    thought_gap_ms:   _ns2ms(m.t_first_update, m.t_first_thought),
+    n_messages: meta.nMessages ?? null,
+    n_tools: meta.nTools ?? null,
+    acquire_ms: _ns2ms(m.t_req_start, m.t_acquired),
+    session_new_ms: _ns2ms(m.t_acquired, m.t_session_created),
+    set_mode_ms: _ns2ms(m.t_session_created, m.t_post_session),
+    set_model_ms: _ns2ms(m.t_post_session ?? m.t_acquired, m.t_set_model),
+    prefill_ms: _ns2ms(m.t_prompt_sent, m.t_first_update),
+    thought_gap_ms: _ns2ms(m.t_first_update, m.t_first_thought),
     reasoning_gap_ms: _ns2ms(m.t_first_update, m.t_first_text),
-    gen_ms:           _ns2ms(m.t_first_text, m.t_complete),
-    total_ms:         _ns2ms(m.t_req_start, m.t_complete),
-    reply_chars:      chunks ? replyChars : null,
-    n_text:           chunks ? nText : null,
-    n_thought:        chunks ? nThought : null,
-    n_chunks:         chunks ? chunks.length : null,
+    gen_ms: _ns2ms(m.t_first_text, m.t_complete),
+    total_ms: _ns2ms(m.t_req_start, m.t_complete),
+    reply_chars: chunks ? replyChars : null,
+    n_text: chunks ? nText : null,
+    n_thought: chunks ? nThought : null,
+    n_chunks: chunks ? chunks.length : null,
   };
   if (DEBUG) {
     _timings.push(rec);
     if (_timings.length > _TIMINGS_MAX) _timings.shift();
     dbg('timing', JSON.stringify(rec));
-    log('perf', `${rec.session ?? '-'}  in=${rec.prompt_tokens_est ?? '?'}tok/${rec.n_tools ?? 0}tools  prefill=${rec.prefill_ms ?? '?'}ms  reason=${rec.reasoning_gap_ms ?? 0}ms  gen=${rec.gen_ms ?? '?'}ms  total=${rec.total_ms ?? '?'}ms  rid=${rec.rid}`);
+    log(
+      'perf',
+      `${rec.session ?? '-'}  in=${rec.prompt_tokens_est ?? '?'}tok/${rec.n_tools ?? 0}tools  prefill=${rec.prefill_ms ?? '?'}ms  reason=${rec.reasoning_gap_ms ?? 0}ms  gen=${rec.gen_ms ?? '?'}ms  total=${rec.total_ms ?? '?'}ms  rid=${rec.rid}`,
+    );
   }
   return rec;
 }
@@ -353,7 +493,7 @@ function promptCharLen(blocks) {
 // Derive a stable session ID from the system message content.
 // Same system prompt → same session, so conversation context survives across turns.
 function autoSessionId(messages) {
-  const sys = messages?.find?.(m => m.role === 'system');
+  const sys = messages?.find?.((m) => m.role === 'system');
   const key = sys ? contentText(sys.content) : '__no_system__';
   return 'auto:' + createHash('sha1').update(key).digest('hex').slice(0, 16);
 }
@@ -374,7 +514,8 @@ function pickCwd(blocks, fallback) {
   const common = [];
   for (let i = 0; i < split[0].length; i++) {
     const seg = split[0][i];
-    if (split.every((s) => s[i] === seg)) common.push(seg); else break;
+    if (split.every((s) => s[i] === seg)) common.push(seg);
+    else break;
   }
   return common.join('/') || fallback;
 }
@@ -385,10 +526,10 @@ function ollamaError(res, status, message) {
 
 function inferMimeType(b64) {
   const head = b64.slice(0, 8);
-  if (head.startsWith('/9j/'))      return 'image/jpeg';
+  if (head.startsWith('/9j/')) return 'image/jpeg';
   if (head.startsWith('iVBORw0K')) return 'image/png';
-  if (head.startsWith('R0lGOD'))   return 'image/gif';
-  if (head.startsWith('UklGR'))    return 'image/webp';
+  if (head.startsWith('R0lGOD')) return 'image/gif';
+  if (head.startsWith('UklGR')) return 'image/webp';
   return 'image/jpeg';
 }
 
@@ -397,16 +538,16 @@ function inferMimeType(b64) {
 class ACPSession extends EventEmitter {
   constructor(label = 'anon') {
     super();
-    this.label      = label;
-    this._proc      = null;
-    this._rl        = null;
-    this._msgId     = 0;
-    this._pending   = new Map();
-    this.sessionId  = null;
-    this.sessionCwd = null;          // cwd the active session was created with (pool reuse)
-    this._sessionConsumed = false;   // true once a stateless turn has used this session
+    this.label = label;
+    this._proc = null;
+    this._rl = null;
+    this._msgId = 0;
+    this._pending = new Map();
+    this.sessionId = null;
+    this.sessionCwd = null; // cwd the active session was created with (pool reuse)
+    this._sessionConsumed = false; // true once a stateless turn has used this session
     this._pingTimer = null;
-    this._dead      = false;
+    this._dead = false;
   }
 
   async start() {
@@ -420,7 +561,8 @@ class ACPSession extends EventEmitter {
       this._dead = true;
       this._stopPing();
       log(`proc:${this.label}`, `exited (${code}), failing ${this._pending.size} pending`);
-      for (const [, { reject }] of this._pending) reject(new Error(`${PROFILE.label} exited (${code})`));
+      for (const [, { reject }] of this._pending)
+        reject(new Error(`${PROFILE.label} exited (${code})`));
       this._pending.clear();
       this.emit('dead');
     });
@@ -432,14 +574,26 @@ class ACPSession extends EventEmitter {
         const msg = JSON.parse(line);
         this._dbgLine(msg);
         this._route(msg);
-      } catch (e) { dbg('parse', e.message); }
+      } catch (e) {
+        dbg('parse', e.message);
+      }
     });
     await new Promise((res, rej) => {
       let done = false;
-      const ok = () => { if (!done) { done = true; res(); } };
+      const ok = () => {
+        if (!done) {
+          done = true;
+          res();
+        }
+      };
       this._proc.stdout.once('readable', ok);
       setTimeout(ok, 600);
-      this._proc.once('exit', (c) => { if (!done) { done = true; rej(new Error(`died at startup (${c})`)); } });
+      this._proc.once('exit', (c) => {
+        if (!done) {
+          done = true;
+          rej(new Error(`died at startup (${c})`));
+        }
+      });
     });
   }
 
@@ -462,17 +616,26 @@ class ACPSession extends EventEmitter {
   close() {
     this._dead = true;
     this._stopPing();
-    try { this._proc?.stdin.end(); this._proc?.kill(); } catch {}
+    try {
+      this._proc?.stdin.end();
+      this._proc?.kill();
+    } catch {}
   }
 
   cancel() {
     if (!this.alive || !this.sessionId) return;
     try {
-      this._send({ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId: this.sessionId } });
+      this._send({
+        jsonrpc: '2.0',
+        method: 'session/cancel',
+        params: { sessionId: this.sessionId },
+      });
     } catch {}
   }
 
-  get alive() { return !this._dead && this._proc && !this._proc.killed; }
+  get alive() {
+    return !this._dead && this._proc && !this._proc.killed;
+  }
 
   _dbgLine(msg) {
     if (!DEBUG) return;
@@ -480,7 +643,10 @@ class ACPSession extends EventEmitter {
     if (skip === 'skip') return;
     if (skip === 'commands') {
       const p = msg.params ?? {};
-      dbg(`←${this.label}`, `commands/available  commands=${p.commands?.length ?? 0}  tools=${p.tools?.length ?? 0}  mcp=${p.mcpServers?.length ?? 0}`);
+      dbg(
+        `←${this.label}`,
+        `commands/available  commands=${p.commands?.length ?? 0}  tools=${p.tools?.length ?? 0}  mcp=${p.mcpServers?.length ?? 0}`,
+      );
       return;
     }
     const raw = JSON.stringify(msg);
@@ -496,22 +662,32 @@ class ACPSession extends EventEmitter {
       return;
     }
     if (msg.method === 'session/request_permission') {
-      this._send({ jsonrpc: '2.0', id: msg.id, result: { optionId: 'allow_always', granted: true } });
+      this._send({
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: { optionId: 'allow_always', granted: true },
+      });
       return;
     }
     // Streaming notifications — the backend profile parses the (varied) shapes
     if (PROFILE.updateMethods.has(msg.method)) {
       const c = PROFILE.parseUpdate(msg.params ?? {});
       if (!c) return;
-      if (c.kind === 'unhandled') { dbg(`update:${this.label}`, `unhandled "${c.type}"`); return; }
+      if (c.kind === 'unhandled') {
+        dbg(`update:${this.label}`, `unhandled "${c.type}"`);
+        return;
+      }
       this.emit('chunk', c);
     }
   }
 
   // Like _req, but catches+logs instead of throwing — used for best-effort calls.
   async _reqSafe(tag, method, params) {
-    try { return await this._req(method, params); }
-    catch (e) { log(`${tag}:${this.label}`, `${method} failed (${e.message})`); }
+    try {
+      return await this._req(method, params);
+    } catch (e) {
+      log(`${tag}:${this.label}`, `${method} failed (${e.message})`);
+    }
   }
 
   async initialize() {
@@ -524,18 +700,19 @@ class ACPSession extends EventEmitter {
     this.promptCapabilities = caps;
     dbg(`init:${this.label}`, `promptCapabilities=${JSON.stringify(caps)}`);
     // Codex expects the initialized notification; Kiro rejects it (profile-gated).
-    if (PROFILE.sendInitialized) this._send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+    if (PROFILE.sendInitialized)
+      this._send({ jsonrpc: '2.0', method: 'notifications/initialized' });
     this._startPing();
   }
 
   async newSession(cwd = CWD, timings) {
     const result = await this._req('session/new', { cwd, mcpServers: [] });
     if (timings) timings.t_session_created = process.hrtime.bigint();
-    this.sessionCwd       = cwd;
+    this.sessionCwd = cwd;
     this._sessionConsumed = false;
-    this.sessionId       = result?.sessionId ?? result?.id;
+    this.sessionId = result?.sessionId ?? result?.id;
     this.availableModels = result?.models?.availableModels?.map((m) => m.modelId) ?? [];
-    this.currentModel    = result?.models?.currentModelId ?? 'auto';
+    this.currentModel = result?.models?.currentModelId ?? 'auto';
     // Backend-specific post-session setup (e.g. codex session/set_mode full-access)
     await PROFILE.postNewSession(this);
     if (timings) timings.t_post_session = process.hrtime.bigint();
@@ -556,9 +733,9 @@ class ACPSession extends EventEmitter {
     const handler = (c) => {
       if (timings) {
         const now = process.hrtime.bigint();
-        if (timings.t_first_update  == null) timings.t_first_update  = now;
+        if (timings.t_first_update == null) timings.t_first_update = now;
         if (c.kind === 'thought' && timings.t_first_thought == null) timings.t_first_thought = now;
-        if (c.kind === 'text'    && timings.t_first_text    == null) timings.t_first_text    = now;
+        if (c.kind === 'text' && timings.t_first_text == null) timings.t_first_text = now;
       }
       chunks.push(c);
       if (c.kind === 'text') textLen += c.text.length;
@@ -570,8 +747,8 @@ class ACPSession extends EventEmitter {
     try {
       await this._req('session/prompt', {
         sessionId: this.sessionId,
-        prompt:    blocks,
-        content:   blocks,
+        prompt: blocks,
+        content: blocks,
       });
     } finally {
       this.off('chunk', handler);
@@ -583,7 +760,10 @@ class ACPSession extends EventEmitter {
 
   _startPing() {
     this._pingTimer = setInterval(async () => {
-      if (!this.alive) { this._stopPing(); return; }
+      if (!this.alive) {
+        this._stopPing();
+        return;
+      }
       try {
         await Promise.race([
           this._req('ping', {}),
@@ -598,14 +778,27 @@ class ACPSession extends EventEmitter {
     this._pingTimer.unref();
   }
 
-  _stopPing() { if (this._pingTimer) { clearInterval(this._pingTimer); this._pingTimer = null; } }
+  _stopPing() {
+    if (this._pingTimer) {
+      clearInterval(this._pingTimer);
+      this._pingTimer = null;
+    }
+  }
+}
+
+// Instantiate the session class for the active backend. ACP backends use
+// ACPSession (module globals); codex-appserver uses its own class and needs the
+// interface-file globals injected via ctx (they are not visible from its module).
+function makeClient(label) {
+  const Cls = PROFILE.SessionClass ?? ACPSession;
+  return new Cls(label, { profile: PROFILE, cwd: CWD, debug: DEBUG, log, dbg });
 }
 
 // ─── Pool & Registry ──────────────────────────────────────────────────────────
 
 class ACPPool {
   constructor(size) {
-    this._size  = size;
+    this._size = size;
     this._slots = [];
     this._queue = [];
   }
@@ -617,19 +810,29 @@ class ACPPool {
   }
   async _initSlot(slot) {
     try {
-      const c = new ACPSession(`pool-${this._slots.indexOf(slot)}`);
-      await c.start(); await c.initialize();
+      const c = makeClient(`pool-${this._slots.indexOf(slot)}`);
+      await c.start();
+      await c.initialize();
       // POOL_PRECREATE: pre-pay session/new + set_mode at warmup (recycled on release).
       if (POOL_PRECREATE) await c.newSession(CWD);
-      c.once('dead', () => { slot.client = null; });
+      c.once('dead', () => {
+        slot.client = null;
+      });
       slot.client = c;
-    } catch (e) { log('pool', `slot init failed: ${e.message}`); slot.client = null; }
+    } catch (e) {
+      log('pool', `slot init failed: ${e.message}`);
+      slot.client = null;
+    }
   }
   async acquire() {
     const free = this._slots.find((s) => !s.busy);
     if (free) {
       free.busy = true;
-      if (free._recycle) { try { await free._recycle; } catch {} }
+      if (free._recycle) {
+        try {
+          await free._recycle;
+        } catch {}
+      }
       if (!free.client?.alive) await this._initSlot(free);
       return free;
     }
@@ -647,17 +850,22 @@ class ACPPool {
     // No waiter: recycle a consumed session in the background so the next acquirer gets
     // a fresh, isolated, already-warm session. The handler re-creates inline if needed.
     if (POOL_PRECREATE && slot.client?.alive && slot.client._sessionConsumed) {
-      slot._recycle = slot.client.newSession(CWD)
+      slot._recycle = slot.client
+        .newSession(CWD)
         .catch((e) => log('pool', `recycle failed: ${e.message}`))
-        .finally(() => { slot._recycle = null; });
+        .finally(() => {
+          slot._recycle = null;
+        });
     }
   }
-  shutdown() { this._slots.forEach((s) => s.client?.close()); }
+  shutdown() {
+    this._slots.forEach((s) => s.client?.close());
+  }
   get stats() {
     return {
-      size:   this._size,
-      busy:   this._slots.filter((s) => s.busy).length,
-      alive:  this._slots.filter((s) => s.client?.alive).length,
+      size: this._size,
+      busy: this._slots.filter((s) => s.busy).length,
+      alive: this._slots.filter((s) => s.client?.alive).length,
       queued: this._queue.length,
     };
   }
@@ -665,7 +873,7 @@ class ACPPool {
 
 class SessionRegistry {
   constructor() {
-    this._map   = new Map();
+    this._map = new Map();
     this._timer = setInterval(() => this._reap(), 60_000);
     this._timer.unref();
   }
@@ -678,8 +886,10 @@ class SessionRegistry {
     }
     let created = false;
     if (!entry) {
-      const c = new ACPSession(`reg-${sessionId.slice(0, 8)}`);
-      await c.start(); await c.initialize(); await c.newSession(cwd);
+      const c = makeClient(`reg-${sessionId.slice(0, 8)}`);
+      await c.start();
+      await c.initialize();
+      await c.newSession(cwd);
       created = true;
       entry = { client: c, lastUsed: Date.now() };
       this._map.set(sessionId, entry);
@@ -690,28 +900,46 @@ class SessionRegistry {
   }
   delete(sessionId) {
     const entry = this._map.get(sessionId);
-    if (entry) { entry.client.close(); this._map.delete(sessionId); }
+    if (entry) {
+      entry.client.close();
+      this._map.delete(sessionId);
+    }
   }
   _reap() {
     const cutoff = Date.now() - SESSION_TTL_MS;
     for (const [id, entry] of this._map) {
-      if (entry.lastUsed < cutoff) { log('registry', `TTL reap ${id}`); entry.client.close(); this._map.delete(id); }
+      if (entry.lastUsed < cutoff) {
+        log('registry', `TTL reap ${id}`);
+        entry.client.close();
+        this._map.delete(id);
+      }
     }
   }
-  get stats() { return { sessions: this._map.size }; }
+  get stats() {
+    return { sessions: this._map.size };
+  }
 }
 
 // ─── EmbeddingRegistry ────────────────────────────────────────────────────────
 
 // Friendly model names that map 1:1 onto fastembed's EmbeddingModel enum keys.
 const EMBEDDING_MODEL_NAMES = [
-  'BGESmallENV15', 'BGEBaseENV15', 'BGESmallEN', 'BGEBaseEN', 'BGESmallZH', 'AllMiniLML6V2', 'MLE5Large',
+  'BGESmallENV15',
+  'BGEBaseENV15',
+  'BGESmallEN',
+  'BGEBaseEN',
+  'BGESmallZH',
+  'AllMiniLML6V2',
+  'MLE5Large',
 ];
 
 class ModelNotEnabledError extends Error {}
 
 class EmbeddingRegistry {
-  constructor() { this._cache = new Map(); this._installed = null; }
+  constructor() {
+    this._cache = new Map();
+    this._installed = null;
+  }
 
   async init() {
     try {
@@ -724,11 +952,15 @@ class EmbeddingRegistry {
     this._installed = true;
     const t0 = Date.now();
     await this.getModel(EMBEDDING_MODEL_DEFAULT);
-    log('embeddings', `default model ${EMBEDDING_MODEL_DEFAULT} loaded in ${Date.now() - t0}ms (providers: ${EMBEDDING_PROVIDERS.join(',')})`);
+    log(
+      'embeddings',
+      `default model ${EMBEDDING_MODEL_DEFAULT} loaded in ${Date.now() - t0}ms (providers: ${EMBEDDING_PROVIDERS.join(',')})`,
+    );
   }
 
   async getModel(name) {
-    if (!EMBEDDING_MODELS_ENABLED.includes(name) || !EMBEDDING_MODEL_NAMES.includes(name)) throw new ModelNotEnabledError(name);
+    if (!EMBEDDING_MODELS_ENABLED.includes(name) || !EMBEDDING_MODEL_NAMES.includes(name))
+      throw new ModelNotEnabledError(name);
     if (this._cache.has(name)) return this._cache.get(name);
     const { EmbeddingModel, FlagEmbedding } = await loadFastembed();
     const enumVal = EmbeddingModel[name];
@@ -743,7 +975,10 @@ class EmbeddingRegistry {
       // GPU provider unavailable (no DX12 device, missing driver, …) — degrade to CPU
       // rather than crashing startup. No-op when CPU was already the only provider.
       if (EMBEDDING_PROVIDERS.length === 1 && EMBEDDING_PROVIDERS[0] === 'cpu') throw e;
-      log('embeddings', `provider [${EMBEDDING_PROVIDERS.join(',')}] init failed for ${name} (${e.message}) — falling back to cpu`);
+      log(
+        'embeddings',
+        `provider [${EMBEDDING_PROVIDERS.join(',')}] init failed for ${name} (${e.message}) — falling back to cpu`,
+      );
       model = await FlagEmbedding.init({ ...opts, executionProviders: ['cpu'] });
     }
     this._cache.set(name, model);
@@ -751,13 +986,17 @@ class EmbeddingRegistry {
   }
 
   get stats() {
-    return { loaded: [...this._cache.keys()], available: EMBEDDING_MODELS_ENABLED, installed: this._installed !== false };
+    return {
+      loaded: [...this._cache.keys()],
+      available: EMBEDDING_MODELS_ENABLED,
+      installed: this._installed !== false,
+    };
   }
 }
 
 // ─── Globals ──────────────────────────────────────────────────────────────────
 
-const pool     = new ACPPool(POOL_SIZE);
+const pool = new ACPPool(POOL_SIZE);
 const registry = new SessionRegistry();
 
 await pool.warmup();
@@ -766,14 +1005,22 @@ const embeddings = new EmbeddingRegistry();
 await embeddings.init();
 
 ['SIGINT', 'SIGTERM'].forEach((sig) => {
-  process.on(sig, () => { log('shutdown', sig); pool.shutdown(); process.exit(0); });
+  process.on(sig, () => {
+    log('shutdown', sig);
+    pool.shutdown();
+    process.exit(0);
+  });
 });
 
 // ─── Message conversion ───────────────────────────────────────────────────────
 
 function contentText(c) {
   if (typeof c === 'string') return c;
-  if (Array.isArray(c)) return c.filter((p) => p.type === 'text').map((p) => p.text ?? '').join('');
+  if (Array.isArray(c))
+    return c
+      .filter((p) => p.type === 'text')
+      .map((p) => p.text ?? '')
+      .join('');
   return String(c ?? '');
 }
 
@@ -790,7 +1037,7 @@ function contentText(c) {
 function buildAcpBlocksFromOllama(messages, tools, opts = {}) {
   const { format, think } = opts;
   const system = messages.find((m) => m.role === 'system');
-  const turns  = messages.filter((m) => m.role !== 'system');
+  const turns = messages.filter((m) => m.role !== 'system');
 
   let text = '';
 
@@ -817,7 +1064,11 @@ function buildAcpBlocksFromOllama(messages, tools, opts = {}) {
     text += `Rules: (1) ONE tool call per response. (2) No text before or after the JSON block. `;
     text += `(3) Do NOT use \`\`\`tool_call\`\`\` fences or Python function-call syntax.\n`;
     text += `Available tools:\n`;
-    text += `\`\`\`json\n${JSON.stringify(tools.map((t) => t.function ?? t), null, 2)}\n\`\`\`\n\n`;
+    text += `\`\`\`json\n${JSON.stringify(
+      tools.map((t) => t.function ?? t),
+      null,
+      2,
+    )}\n\`\`\`\n\n`;
   }
 
   // Conversation history
@@ -868,11 +1119,12 @@ function buildAcpBlocksFromGenerate(prompt, system, images, opts = {}) {
  * Unlike OpenAI, Ollama tool_calls[].function.arguments is a plain object (not JSON string).
  */
 function chunksToOllamaMessage(chunks, wantThinking) {
-  const textParts = [], thoughtParts = [];
+  const textParts = [],
+    thoughtParts = [];
   const toolCallMap = new Map();
 
   for (const c of chunks) {
-    if (c.kind === 'text')    textParts.push(c.text);
+    if (c.kind === 'text') textParts.push(c.text);
     if (c.kind === 'thought') thoughtParts.push(c.text);
     if (c.kind === 'tool_call_start') {
       toolCallMap.set(c.toolCallId, { id: makeToolCallId(), name: c.name, argsParts: [] });
@@ -891,7 +1143,11 @@ function chunksToOllamaMessage(chunks, wantThinking) {
     tool_calls = [...toolCallMap.values()].map((tc) => {
       let args = {};
       if (tc.argsParts.length) {
-        try { args = JSON.parse(tc.argsParts.join('')); } catch { args = {}; }
+        try {
+          args = JSON.parse(tc.argsParts.join(''));
+        } catch {
+          args = {};
+        }
       }
       return { function: { name: tc.name, arguments: args } };
     });
@@ -909,34 +1165,44 @@ function chunksToOllamaMessage(chunks, wantThinking) {
  * Build Ollama timing stats. startNs is process.hrtime.bigint() captured before the prompt.
  */
 function makeStats(startNs, promptBlocks, content) {
-  const totalNs   = Number(process.hrtime.bigint() - startNs);
+  const totalNs = Number(process.hrtime.bigint() - startNs);
   const promptTxt = promptBlocks.map((b) => b.text ?? '').join('');
   return {
-    total_duration:       totalNs,
-    load_duration:        0,
-    prompt_eval_count:    estimateTokens(promptTxt),
+    total_duration: totalNs,
+    load_duration: 0,
+    prompt_eval_count: estimateTokens(promptTxt),
     prompt_eval_duration: Math.floor(totalNs * 0.15),
-    eval_count:           estimateTokens(content ?? ''),
-    eval_duration:        Math.floor(totalNs * 0.85),
+    eval_count: estimateTokens(content ?? ''),
+    eval_duration: Math.floor(totalNs * 0.85),
   };
 }
 
 // ─── NDJSON streaming helpers ─────────────────────────────────────────────────
 
-function ndjsonLine(obj) { return JSON.stringify(obj) + '\n'; }
+function ndjsonLine(obj) {
+  return JSON.stringify(obj) + '\n';
+}
 
 function tryParseJson(str) {
-  try { return JSON.parse(str.trim()); } catch { return null; }
+  try {
+    return JSON.parse(str.trim());
+  } catch {
+    return null;
+  }
 }
 
 function pickBestTool(obj, tools) {
   if (tools.length === 1) return tools[0];
   const objKeys = new Set(Object.keys(obj));
-  let best = tools[0], bestScore = 0;
+  let best = tools[0],
+    bestScore = 0;
   for (const t of tools) {
     const props = Object.keys(t?.function?.parameters?.properties ?? {});
-    const score = props.filter(k => objKeys.has(k)).length;
-    if (score > bestScore) { bestScore = score; best = t; }
+    const score = props.filter((k) => objKeys.has(k)).length;
+    if (score > bestScore) {
+      bestScore = score;
+      best = t;
+    }
   }
   return best;
 }
@@ -950,18 +1216,29 @@ function parsePyFnCallArgs(argsStr, toolDef) {
   let m;
   while ((m = kwRe.exec(argsStr)) !== null) {
     const [, key, raw] = m;
-    if      (raw === 'true')       args[key] = true;
-    else if (raw === 'false')      args[key] = false;
-    else if (raw === 'null')       args[key] = null;
-    else if (raw.startsWith('"')) { try { args[key] = JSON.parse(raw); } catch { args[key] = raw.slice(1, -1); } }
-    else                           args[key] = parseFloat(raw);
+    if (raw === 'true') args[key] = true;
+    else if (raw === 'false') args[key] = false;
+    else if (raw === 'null') args[key] = null;
+    else if (raw.startsWith('"')) {
+      try {
+        args[key] = JSON.parse(raw);
+      } catch {
+        args[key] = raw.slice(1, -1);
+      }
+    } else args[key] = parseFloat(raw);
   }
   // Fallback: single positional double-quoted string → first schema param
   if (!Object.keys(args).length) {
     const pos = argsStr.trim().match(/^"((?:[^"\\]|\\.)*)"$/s);
     if (pos) {
       const firstKey = Object.keys(toolDef?.function?.parameters?.properties ?? {})[0];
-      if (firstKey) { try { args[firstKey] = JSON.parse(`"${pos[1]}"`); } catch { args[firstKey] = pos[1]; } }
+      if (firstKey) {
+        try {
+          args[firstKey] = JSON.parse(`"${pos[1]}"`);
+        } catch {
+          args[firstKey] = pos[1];
+        }
+      }
     }
   }
   return args;
@@ -983,7 +1260,11 @@ function coerceToolCall(message, tools) {
   if (parsed?.tool_call?.name) {
     const tc = parsed.tool_call;
     dbg('coerce', `tool_call wrapper → "${tc.name}"`);
-    return { ...message, content: '', tool_calls: [{ function: { name: tc.name, arguments: tc.arguments ?? {} } }] };
+    return {
+      ...message,
+      content: '',
+      tool_calls: [{ function: { name: tc.name, arguments: tc.arguments ?? {} } }],
+    };
   }
 
   // Detect ```tool_call\nfn_name(key="val", ...)\n``` fence (Claude's native function-call format).
@@ -992,11 +1273,15 @@ function coerceToolCall(message, tools) {
     const tcFence = content.match(/```tool_call\s*\n(\w+)\(([\s\S]*?)\)\s*\n```/);
     if (tcFence) {
       const name = tcFence[1];
-      const tool = tools.find(t => (t.function?.name ?? t.name) === name);
+      const tool = tools.find((t) => (t.function?.name ?? t.name) === name);
       if (tool) {
         const arguments_ = parsePyFnCallArgs(tcFence[2], tool);
         dbg('coerce', `tool_call fence → "${name}"`);
-        return { ...message, content: '', tool_calls: [{ function: { name, arguments: arguments_ } }] };
+        return {
+          ...message,
+          content: '',
+          tool_calls: [{ function: { name, arguments: arguments_ } }],
+        };
       }
     }
   }
@@ -1012,7 +1297,7 @@ function coerceToolCall(message, tools) {
         const kv = line.match(/^(\w+)\s*:\s*(.+)$/);
         if (kv) args[kv[1]] = isNaN(kv[2]) ? kv[2].trim() : Number(kv[2]);
       }
-      const tool = tools.find(t => (t.function?.name ?? t.name) === name);
+      const tool = tools.find((t) => (t.function?.name ?? t.name) === name);
       if (tool) {
         dbg('coerce', `natural language → tool_call "${name}"`);
         return { ...message, content: '', tool_calls: [{ function: { name, arguments: args } }] };
@@ -1030,9 +1315,9 @@ function coerceToolCall(message, tools) {
 }
 
 function setNdjsonHeaders(res) {
-  res.setHeader('Content-Type',      'application/x-ndjson');
+  res.setHeader('Content-Type', 'application/x-ndjson');
   res.setHeader('Transfer-Encoding', 'chunked');
-  res.setHeader('Cache-Control',     'no-cache');
+  res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('X-Accel-Buffering', 'no');
 }
 
@@ -1040,12 +1325,20 @@ function setNdjsonHeaders(res) {
 
 const app = express();
 
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Authorization', 'Content-Type', 'X-Session-Id', 'X-Working-Dir', 'X-Request-Id'],
-  exposedHeaders: ['X-Request-Id'],
-}));
+app.use(
+  cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+    allowedHeaders: [
+      'Authorization',
+      'Content-Type',
+      'X-Session-Id',
+      'X-Working-Dir',
+      'X-Request-Id',
+    ],
+    exposedHeaders: ['X-Request-Id'],
+  }),
+);
 
 app.use(express.json({ limit: '8mb' }));
 
@@ -1061,7 +1354,10 @@ if (DEBUG) {
     const t0 = Date.now();
     res.on('finish', () => {
       const model = req.body?.model ?? '-';
-      log('req', `${req.method} ${req.path}  model=${model}  ${res.statusCode}  ${Date.now() - t0}ms`);
+      log(
+        'req',
+        `${req.method} ${req.path}  model=${model}  ${res.statusCode}  ${Date.now() - t0}ms`,
+      );
     });
     next();
   });
@@ -1073,26 +1369,36 @@ app.use((req, res, next) => {
   if (DEBUG && req.path === '/debug/timings') return next();
 
   if (ALLOWED_IPS.length > 0) {
-    const ip = (req.headers['x-forwarded-for']?.split(',')[0] ?? req.socket.remoteAddress ?? '').replace('::ffff:', '');
+    const ip = (
+      req.headers['x-forwarded-for']?.split(',')[0] ??
+      req.socket.remoteAddress ??
+      ''
+    ).replace('::ffff:', '');
     if (!ALLOWED_IPS.includes(ip)) return ollamaError(res, 403, `IP ${ip} not in allowlist`);
   }
 
   if (AUTH_TOKENS.length > 0) {
     const hdr = req.headers['authorization'] ?? '';
-    const m   = hdr.match(/^Bearer\s+(.+)$/i);
-    if (!m || !AUTH_TOKENS.includes(m[1])) return ollamaError(res, 401, 'Invalid or missing API key');
+    const m = hdr.match(/^Bearer\s+(.+)$/i);
+    if (!m || !AUTH_TOKENS.includes(m[1]))
+      return ollamaError(res, 401, 'Invalid or missing API key');
   }
 
   next();
 });
 
 // ── Version / root ────────────────────────────────────────────────────────────
-app.get('/',            (_, res) => res.json({ version: '0.9.0' }));
+app.get('/', (_, res) => res.json({ version: '0.9.0' }));
 app.get('/api/version', (_, res) => res.json({ version: '0.9.0' }));
 
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get('/health', (_, res) => {
-  res.json({ status: 'ok', pool: pool.stats, registry: registry.stats, embeddings: embeddings.stats });
+  res.json({
+    status: 'ok',
+    pool: pool.stats,
+    registry: registry.stats,
+    embeddings: embeddings.stats,
+  });
 });
 
 // Latency split ring buffer — DEBUG only, unauthenticated like /health
@@ -1107,11 +1413,13 @@ app.get('/health/agents', (_, res) => {
     pool: pool._slots.map((s, i) => ({
       index: i,
       alive: !!s.client?.alive,
-      busy:  s.busy,
+      busy: s.busy,
       label: s.client?.label ?? null,
     })),
     sessions: [...registry._map.entries()].map(([id, e]) => ({
-      id, alive: e.client.alive, last_used: e.lastUsed,
+      id,
+      alive: e.client.alive,
+      last_used: e.lastUsed,
     })),
   });
 });
@@ -1120,15 +1428,15 @@ app.get('/health/agents', (_, res) => {
 
 function toOllamaModel(modelId, description) {
   return {
-    name:        modelId,
-    model:       modelId,
+    name: modelId,
+    model: modelId,
     modified_at: new Date().toISOString(),
-    size:        0,
-    digest:      '',
+    size: 0,
+    digest: '',
     details: {
-      format:             'gguf',
-      family:             'kiro',
-      parameter_size:     description ?? 'unknown',
+      format: 'gguf',
+      family: 'kiro',
+      parameter_size: description ?? 'unknown',
       quantization_level: 'unknown',
     },
   };
@@ -1136,48 +1444,59 @@ function toOllamaModel(modelId, description) {
 
 app.get('/api/tags', (_, res) => {
   const kiroModels = _startupModels.map((id) =>
-    toOllamaModel(id, id === 'auto' ? 'Kiro default model selection' : undefined)
+    toOllamaModel(id, id === 'auto' ? 'Kiro default model selection' : undefined),
   );
-  const embedModels = EMBEDDING_MODELS_ENABLED
-    .filter((id) => !_startupModels.includes(id))
-    .map((id) => toOllamaModel(id, `Embedding model (fastembed)`));
+  const embedModels = EMBEDDING_MODELS_ENABLED.filter((id) => !_startupModels.includes(id)).map(
+    (id) => toOllamaModel(id, `Embedding model (fastembed)`),
+  );
   res.json({ models: [...kiroModels, ...embedModels] });
 });
 
 app.post('/api/show', (req, res) => {
   const { model = 'auto' } = req.body ?? {};
   const isEmbed = EMBEDDING_MODELS_ENABLED.includes(model);
-  const isKiro  = _startupModels.includes(model);
+  const isKiro = _startupModels.includes(model);
   if (!isEmbed && !isKiro) return ollamaError(res, 404, `model '${model}' not found`);
   res.json({
     model,
-    modified_at:  new Date().toISOString(),
-    details:      { format: 'gguf', family: 'kiro', parameter_size: 'unknown', quantization_level: 'unknown' },
+    modified_at: new Date().toISOString(),
+    details: {
+      format: 'gguf',
+      family: 'kiro',
+      parameter_size: 'unknown',
+      quantization_level: 'unknown',
+    },
     capabilities: isEmbed ? ['embedding'] : ['completion', 'tools'],
-    modelinfo:    {},
-    template:     '',
-    parameters:   '',
-    license:      '',
+    modelinfo: {},
+    template: '',
+    parameters: '',
+    license: '',
   });
 });
 
 app.get('/api/ps', (_, res) => {
   res.json({
-    models: [{
-      name:       'auto',
-      model:      'auto',
-      size:       0,
-      size_vram:  0,
-      details:    { format: 'gguf', family: 'kiro' },
-      expires_at: new Date(Date.now() + SESSION_TTL_MS).toISOString(),
-    }],
+    models: [
+      {
+        name: 'auto',
+        model: 'auto',
+        size: 0,
+        size_vram: 0,
+        details: { format: 'gguf', family: 'kiro' },
+        expires_at: new Date(Date.now() + SESSION_TTL_MS).toISOString(),
+      },
+    ],
   });
 });
 
 // ── Core completion handler ───────────────────────────────────────────────────
 
-async function handleOllamaCompletion(req, res, { blocks, model, stream, wantThinking, isGenerate, tools, sessionIdOverride, effort, nMessages }) {
-  const cwd      = req.headers['x-working-dir'] ?? pickCwd(blocks, CWD);
+async function handleOllamaCompletion(
+  req,
+  res,
+  { blocks, model, stream, wantThinking, isGenerate, tools, sessionIdOverride, effort, nMessages },
+) {
+  const cwd = req.headers['x-working-dir'] ?? pickCwd(blocks, CWD);
   const sessionId = req.headers['x-session-id'] ?? sessionIdOverride;
   // Logical-session boundary: clear context on a persistent session without respawn
   // (codex-acp has no /clear; reset by starting a fresh thread on the same process).
@@ -1190,101 +1509,181 @@ async function handleOllamaCompletion(req, res, { blocks, model, stream, wantThi
     ({ client, created } = await registry.acquire(sessionId, cwd));
     marks.t_acquired = process.hrtime.bigint();
     if (clearContext && !created) await client.newSession(cwd, marks);
-    sessionState = created ? 'new' : (clearContext ? 'cleared' : 'reuse');
-    await client.setModel(model);
+    sessionState = created ? 'new' : clearContext ? 'cleared' : 'reuse';
+    await client.setModel(resolveModel(model));
     await client.setReasoning(effort);
     marks.t_set_model = process.hrtime.bigint();
   } else {
-    slot   = await pool.acquire();
+    slot = await pool.acquire();
     client = slot.client;
     marks.t_acquired = process.hrtime.bigint();
     // Reuse a pre-created, unconsumed session for the same cwd (POOL_PRECREATE).
-    const reuse = POOL_PRECREATE && client.sessionId && !client._sessionConsumed && client.sessionCwd === cwd;
+    const reuse =
+      POOL_PRECREATE && client.sessionId && !client._sessionConsumed && client.sessionCwd === cwd;
     if (!reuse) await client.newSession(cwd, marks);
     client._sessionConsumed = true;
     sessionState = reuse ? 'reuse' : 'new';
-    await client.setModel(model);
+    await client.setModel(resolveModel(model));
     await client.setReasoning(effort);
     marks.t_set_model = process.hrtime.bigint();
   }
 
-  const timingMeta = { rid, model, tools: !!tools?.length, stream,
-    session: sessionState, promptChars: promptCharLen(blocks), nMessages: nMessages ?? null, nTools: tools?.length ?? 0 };
+  const timingMeta = {
+    rid,
+    model,
+    tools: !!tools?.length,
+    stream,
+    session: sessionState,
+    promptChars: promptCharLen(blocks),
+    nMessages: nMessages ?? null,
+    nTools: tools?.length ?? 0,
+  };
   const startNs = marks.t_req_start;
 
   try {
     if (stream) {
       setNdjsonHeaders(res);
-      req.on('close', () => { if (!res.writableEnded) client.cancel(); });
+      req.on('close', () => {
+        if (!res.writableEnded) client.cancel();
+      });
 
       const allChunks = [];
-      await client.prompt(blocks, (chunk) => {
-        allChunks.push(chunk);
-        if (!res.writable) return;
-        // When tools are present, don't stream text — wait for final message
-        // so LangFlow doesn't see content twice (streamed + final)
-        if (tools?.length) return;
-        if (chunk.kind === 'text') {
-          if (isGenerate) {
-            res.write(ndjsonLine({ model, created_at: new Date().toISOString(), response: chunk.text, done: false }));
-          } else {
-            res.write(ndjsonLine({ model, created_at: new Date().toISOString(), message: { role: 'assistant', content: chunk.text }, done: false }));
+      await client.prompt(
+        blocks,
+        (chunk) => {
+          allChunks.push(chunk);
+          if (!res.writable) return;
+          // When tools are present, don't stream text — wait for final message
+          // so LangFlow doesn't see content twice (streamed + final)
+          if (tools?.length) return;
+          if (chunk.kind === 'text') {
+            if (isGenerate) {
+              res.write(
+                ndjsonLine({
+                  model,
+                  created_at: new Date().toISOString(),
+                  response: chunk.text,
+                  done: false,
+                }),
+              );
+            } else {
+              res.write(
+                ndjsonLine({
+                  model,
+                  created_at: new Date().toISOString(),
+                  message: { role: 'assistant', content: chunk.text },
+                  done: false,
+                }),
+              );
+            }
           }
-        }
-        if (chunk.kind === 'thought' && wantThinking) {
-          if (isGenerate) {
-            res.write(ndjsonLine({ model, created_at: new Date().toISOString(), response: '', thinking: chunk.text, done: false }));
-          } else {
-            res.write(ndjsonLine({ model, created_at: new Date().toISOString(), message: { role: 'assistant', content: '', thinking: chunk.text }, done: false }));
+          if (chunk.kind === 'thought' && wantThinking) {
+            if (isGenerate) {
+              res.write(
+                ndjsonLine({
+                  model,
+                  created_at: new Date().toISOString(),
+                  response: '',
+                  thinking: chunk.text,
+                  done: false,
+                }),
+              );
+            } else {
+              res.write(
+                ndjsonLine({
+                  model,
+                  created_at: new Date().toISOString(),
+                  message: { role: 'assistant', content: '', thinking: chunk.text },
+                  done: false,
+                }),
+              );
+            }
           }
-        }
-      }, marks);
+        },
+        marks,
+      );
       recordTiming(marks, timingMeta, allChunks);
 
       if (isGenerate) {
-        const textChunks = allChunks.filter((c) => c.kind === 'text').map((c) => c.text).join('');
-        const thoughtChunks = wantThinking ? allChunks.filter((c) => c.kind === 'thought').map((c) => c.text).join('') : null;
+        const textChunks = allChunks
+          .filter((c) => c.kind === 'text')
+          .map((c) => c.text)
+          .join('');
+        const thoughtChunks = wantThinking
+          ? allChunks
+              .filter((c) => c.kind === 'thought')
+              .map((c) => c.text)
+              .join('')
+          : null;
         const stats = makeStats(startNs, blocks, textChunks);
-        res.write(ndjsonLine({
-          model, created_at: new Date().toISOString(),
-          response: '', done: true, done_reason: 'stop',
-          ...(wantThinking && thoughtChunks ? { thinking: thoughtChunks } : {}),
-          ...stats,
-        }));
+        res.write(
+          ndjsonLine({
+            model,
+            created_at: new Date().toISOString(),
+            response: '',
+            done: true,
+            done_reason: 'stop',
+            ...(wantThinking && thoughtChunks ? { thinking: thoughtChunks } : {}),
+            ...stats,
+          }),
+        );
       } else {
         const message = coerceToolCall(chunksToOllamaMessage(allChunks, wantThinking), tools);
-        const stats   = makeStats(startNs, blocks, message.content);
-        dbg('resp', `content=${JSON.stringify(message.content)}  tool_calls=${JSON.stringify(message.tool_calls ?? null)}`);
-        res.write(ndjsonLine({
-          model, created_at: new Date().toISOString(),
-          message, done: true, done_reason: message.tool_calls ? 'tool_calls' : 'stop',
-          ...stats,
-        }));
+        const stats = makeStats(startNs, blocks, message.content);
+        dbg(
+          'resp',
+          `content=${JSON.stringify(message.content)}  tool_calls=${JSON.stringify(message.tool_calls ?? null)}`,
+        );
+        res.write(
+          ndjsonLine({
+            model,
+            created_at: new Date().toISOString(),
+            message,
+            done: true,
+            done_reason: message.tool_calls ? 'tool_calls' : 'stop',
+            ...stats,
+          }),
+        );
       }
       res.end();
-
     } else {
       const chunks = await client.prompt(blocks, undefined, marks);
       recordTiming(marks, timingMeta, chunks);
 
       if (isGenerate) {
-        const textContent = chunks.filter((c) => c.kind === 'text').map((c) => c.text).join('');
-        const thoughtContent = wantThinking ? chunks.filter((c) => c.kind === 'thought').map((c) => c.text).join('') : null;
+        const textContent = chunks
+          .filter((c) => c.kind === 'text')
+          .map((c) => c.text)
+          .join('');
+        const thoughtContent = wantThinking
+          ? chunks
+              .filter((c) => c.kind === 'thought')
+              .map((c) => c.text)
+              .join('')
+          : null;
         const stats = makeStats(startNs, blocks, textContent);
         res.json({
-          model, created_at: new Date().toISOString(),
+          model,
+          created_at: new Date().toISOString(),
           response: textContent,
           ...(wantThinking && thoughtContent ? { thinking: thoughtContent } : {}),
-          done: true, done_reason: 'stop',
+          done: true,
+          done_reason: 'stop',
           ...stats,
         });
       } else {
         const message = coerceToolCall(chunksToOllamaMessage(chunks, wantThinking), tools);
-        const stats   = makeStats(startNs, blocks, message.content);
-        dbg('resp', `content=${JSON.stringify(message.content)}  tool_calls=${JSON.stringify(message.tool_calls ?? null)}`);
+        const stats = makeStats(startNs, blocks, message.content);
+        dbg(
+          'resp',
+          `content=${JSON.stringify(message.content)}  tool_calls=${JSON.stringify(message.tool_calls ?? null)}`,
+        );
         res.json({
-          model, created_at: new Date().toISOString(),
-          message, done: true, done_reason: message.tool_calls ? 'tool_calls' : 'stop',
+          model,
+          created_at: new Date().toISOString(),
+          message,
+          done: true,
+          done_reason: message.tool_calls ? 'tool_calls' : 'stop',
           ...stats,
         });
       }
@@ -1300,11 +1699,11 @@ async function handleOllamaCompletion(req, res, { blocks, model, stream, wantThi
 // ── POST /api/chat ────────────────────────────────────────────────────────────
 app.post('/api/chat', async (req, res) => {
   const {
-    model    = PROFILE.defaultModel,
+    model = PROFILE.defaultModel,
     messages = [],
     tools,
     format,
-    stream   = true,   // Ollama default is true
+    stream = true, // Ollama default is true
     think,
     // keep_alive and options are accepted-and-ignored
   } = req.body ?? {};
@@ -1313,26 +1712,36 @@ app.post('/api/chat', async (req, res) => {
     return ollamaError(res, 400, '`messages` is required and must be a non-empty array');
   }
 
-  const wantThinking     = !!think;
-  const blocks           = buildAcpBlocksFromOllama(messages, tools, { format, think });
-  const sessionIdOverride = AUTO_SESSION_HASH && !req.headers['x-session-id']
-    ? autoSessionId(messages) : undefined;
+  const wantThinking = !!think;
+  const blocks = buildAcpBlocksFromOllama(messages, tools, { format, think });
+  const sessionIdOverride =
+    AUTO_SESSION_HASH && !req.headers['x-session-id'] ? autoSessionId(messages) : undefined;
 
   dbg('chat', `tools=${JSON.stringify(tools ?? null)}  format=${JSON.stringify(format ?? null)}`);
   if (sessionIdOverride) dbg('chat', `auto-session=${sessionIdOverride}`);
 
-  await handleOllamaCompletion(req, res, { blocks, model, stream, wantThinking, isGenerate: false, tools, sessionIdOverride, effort: reasoningFrom(think), nMessages: messages.length });
+  await handleOllamaCompletion(req, res, {
+    blocks,
+    model,
+    stream,
+    wantThinking,
+    isGenerate: false,
+    tools,
+    sessionIdOverride,
+    effort: reasoningFrom(think),
+    nMessages: messages.length,
+  });
 });
 
 // ── POST /api/generate ────────────────────────────────────────────────────────
 app.post('/api/generate', async (req, res) => {
   const {
-    model  = PROFILE.defaultModel,
+    model = PROFILE.defaultModel,
     prompt = '',
     system,
     images,
     format,
-    stream = true,   // Ollama default is true
+    stream = true, // Ollama default is true
     think,
     // suffix, raw, keep_alive, options accepted-and-ignored
   } = req.body ?? {};
@@ -1342,9 +1751,17 @@ app.post('/api/generate', async (req, res) => {
   }
 
   const wantThinking = !!think;
-  const blocks       = buildAcpBlocksFromGenerate(prompt, system, images, { format, think });
+  const blocks = buildAcpBlocksFromGenerate(prompt, system, images, { format, think });
 
-  await handleOllamaCompletion(req, res, { blocks, model, stream, wantThinking, isGenerate: true, effort: reasoningFrom(think), nMessages: 1 });
+  await handleOllamaCompletion(req, res, {
+    blocks,
+    model,
+    stream,
+    wantThinking,
+    isGenerate: true,
+    effort: reasoningFrom(think),
+    nMessages: 1,
+  });
 });
 
 // ── Embeddings ────────────────────────────────────────────────────────────────
@@ -1354,7 +1771,8 @@ async function runEmbeddings(model, inputs) {
   try {
     embeddingModel = await embeddings.getModel(model);
   } catch (err) {
-    if (err instanceof ModelNotEnabledError) throw Object.assign(err, { status: 400, msg: `model '${model}' is not enabled` });
+    if (err instanceof ModelNotEnabledError)
+      throw Object.assign(err, { status: 400, msg: `model '${model}' is not enabled` });
     throw err;
   }
   const vectors = new Array(inputs.length);
@@ -1375,16 +1793,23 @@ app.post('/api/embed', async (req, res) => {
     inputs = [input];
   } else if (Array.isArray(input)) {
     if (!input.length) return ollamaError(res, 400, '`input` array must not be empty');
-    if (input.length > EMBEDDING_MAX_INPUTS) return ollamaError(res, 400, `\`input\` array exceeds max of ${EMBEDDING_MAX_INPUTS}`);
-    inputs = input.map((item) => (typeof item === 'string' && item.trim()) ? item : ' ');
+    if (input.length > EMBEDDING_MAX_INPUTS)
+      return ollamaError(res, 400, `\`input\` array exceeds max of ${EMBEDDING_MAX_INPUTS}`);
+    inputs = input.map((item) => (typeof item === 'string' && item.trim() ? item : ' '));
   } else {
     return ollamaError(res, 400, '`input` is required (string or array of strings)');
   }
 
   try {
-    const vectors      = await runEmbeddings(model, inputs);
+    const vectors = await runEmbeddings(model, inputs);
     const promptTokens = inputs.reduce((sum, t) => sum + estimateTokens(t), 0);
-    res.json({ model, embeddings: vectors, total_duration: 0, load_duration: 0, prompt_eval_count: promptTokens });
+    res.json({
+      model,
+      embeddings: vectors,
+      total_duration: 0,
+      load_duration: 0,
+      prompt_eval_count: promptTokens,
+    });
   } catch (err) {
     if (err.status) return ollamaError(res, err.status, err.msg);
     log('embeddings', 'error', err.message);
@@ -1436,9 +1861,15 @@ app.post('/api/pull', (req, res) => {
   }
 });
 
-app.post('/api/push',   (req, res) => { const { stream = true } = req.body ?? {}; stream ? stubStreaming(res) : res.json({ status: 'success' }); });
-app.post('/api/create', (req, res) => { const { stream = true } = req.body ?? {}; stream ? stubStreaming(res) : res.json({ status: 'success' }); });
-app.post('/api/copy',   (_, res)   => res.json({}));
+app.post('/api/push', (req, res) => {
+  const { stream = true } = req.body ?? {};
+  stream ? stubStreaming(res) : res.json({ status: 'success' });
+});
+app.post('/api/create', (req, res) => {
+  const { stream = true } = req.body ?? {};
+  stream ? stubStreaming(res) : res.json({ status: 'success' });
+});
+app.post('/api/copy', (_, res) => res.json({}));
 app.delete('/api/delete', (_, res) => res.json({}));
 
 // ── Global error handler ──────────────────────────────────────────────────────
@@ -1457,19 +1888,33 @@ try {
     const ids = slot.client.availableModels ?? [];
     if (ids.length) {
       _startupModels = PROFILE.formatStartupModels(ids);
-      log('startup', `discovered ${_startupModels.length} models from ${PROFILE.label}: ${_startupModels.join(', ')}`);
+      log(
+        'startup',
+        `discovered ${_startupModels.length} models from ${PROFILE.label}: ${_startupModels.join(', ')}`,
+      );
     } else {
-      log('startup', `session/new returned no model list — using fallback models (${_startupModels.join(', ')})`);
-      log('startup', `  (set DEBUG=1 to see the raw session/new response and verify the field path)`);
+      log(
+        'startup',
+        `session/new returned no model list — using fallback models (${_startupModels.join(', ')})`,
+      );
+      log(
+        'startup',
+        `  (set DEBUG=1 to see the raw session/new response and verify the field path)`,
+      );
     }
-  } finally { pool.release(slot); }
+  } finally {
+    pool.release(slot);
+  }
 } catch (e) {
-  log('startup', `model discovery failed (${e.message}) — using fallback models (${_startupModels.join(', ')})`);
+  log(
+    'startup',
+    `model discovery failed (${e.message}) — using fallback models (${_startupModels.join(', ')})`,
+  );
 }
 
 const server = app.listen(PORT, HOST, () => {
   const tokenDisplay = AUTH_TOKENS.length
-    ? AUTH_TOKENS.map(t => `${t.slice(0, 18)}…`).join(', ')
+    ? AUTH_TOKENS.map((t) => `${t.slice(0, 18)}…`).join(', ')
     : 'OPEN (no AUTH_TOKEN set)';
   console.log(`┌──────────────────────────────────────────────────────────────┐
 │  ACP → Ollama Proxy  v1.0  —  http://${HOST}:${PORT}

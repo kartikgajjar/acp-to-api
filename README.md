@@ -14,7 +14,10 @@ Two HTTP shims that expose ACP agent backends through standard REST APIs. **The 
 | `--backend` | ACP child | Quirks | Required env |
 |---|---|---|---|
 | `kiro` | `kiro-cli acp` | no `notifications/initialized`; `session/set_model`; auto-grants permissions | — |
-| `codex` | `codex-acp` | sends `notifications/initialized`; `session/set_mode` full-access; `session/set_config_option`; **full-access** | `OPENAI_API_KEY` |
+| `codex` | `codex-acp` | sends `notifications/initialized`; `session/set_mode` full-access; `session/set_config_option`; **full-access** | — (reuses codex login) |
+| `codex-appserver` | `codex app-server` | **native OpenAI protocol** (not ACP): `thread/start` + `turn/start`; async `turn/completed`; per-turn model + effort; `jsonrpc` header omitted; auto-accepts approvals; **full-access** | — (reuses codex login) |
+
+> **`codex` vs `codex-appserver`.** `codex` drives the third-party `@zed-industries/codex-acp` adapter (an ACP shim over the Codex CLI). `codex-appserver` speaks OpenAI's own documented `codex app-server` JSON-RPC protocol directly — no third-party adapter, official + versioned, with native streaming/interrupt/thread reuse. Both reuse the existing `codex login` (no API key needed) and run full-access. `codex-appserver` is the forward path; `codex` (codex-acp) is retained as a legacy fallback. Latency is comparable — both run the same Codex agent harness, so the prefill floor is unchanged; reuse a persistent `X-Session-Id` for the warm-session win.
 
 Point any Ollama-compatible tool at the ollama server, or any OpenAI SDK at the openai server, and requests are transparently routed to the selected ACP agent.
 
@@ -23,9 +26,13 @@ Point any Ollama-compatible tool at the ollama server, or any OpenAI SDK at the 
 ```bash
 node acp-server-ollama.js                  # Ollama + kiro   (defaults)
 node acp-server-openai.js                  # OpenAI + codex  (defaults)
-node acp-server-ollama.js --backend=codex  # Ollama surface over Codex (needs OPENAI_API_KEY)
+node acp-server-ollama.js --backend=codex  # Ollama surface over Codex (codex-acp)
 node acp-server-openai.js --backend=kiro   # OpenAI surface over Kiro
+node acp-server-openai.js --backend=codex-appserver  # OpenAI surface over native codex app-server
+node acp-server-ollama.js --backend=codex-appserver  # Ollama surface over native codex app-server
 ```
+
+The `codex-appserver` backend is configured with `CODEX_APPSERVER_*` env vars: `CODEX_APPSERVER_CMD` (default `codex`), `CODEX_APPSERVER_ARGS` (default `app-server`), `CODEX_APPSERVER_MODE` (`read-only`|`auto`|`full-access`, default `full-access`), `CODEX_APPSERVER_MODEL_DEFAULT` (default `gpt-5.5`), `CODEX_APPSERVER_AVAILABLE_MODELS` (CSV for `/v1/models`), and the shared `CODEX_REASONING_EFFORT` default. It requires the `codex` CLI installed and authenticated (`codex login`).
 
 `OPENAI_API_KEY` is a **backend** requirement: needed whenever `--backend=codex` (on either interface), not needed for `kiro`. Likewise the remote-binding safety gate **follows the backend** — it fires only when the full-access `codex` backend is selected on a non-localhost host without auth.
 

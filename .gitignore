@@ -4,4 +4,5 @@ node_modules/
 *.log
 logs/
 local_cache/
+tmp/
 
