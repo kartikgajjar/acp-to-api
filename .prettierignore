@@ -2,6 +2,7 @@
 node_modules/
 logs/
 tmp/
+tmp2/
 *.log
 
 # Hand-authored docs (tables/layout) — keep verbatim

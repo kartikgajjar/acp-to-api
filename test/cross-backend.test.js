@@ -828,6 +828,28 @@ describe('codex-appserver: native protocol', () => {
     assert.equal(r.ready, false);
     assert.equal(r.exitCode, 1);
   });
+
+  test('thread-not-found on a stateful session recovers via thread/start + retry', async () => {
+    const srv = await startServer({
+      server: 'openai',
+      backend: 'codex-appserver',
+      env: { MOCK_SCENARIO: 'NOT_FOUND_ONCE' },
+    });
+    try {
+      // First turn/start → -32001; the registry client recreates the thread and
+      // retries once, so the caller still sees a 200 with assembled text.
+      const { status, json } = await postJson(
+        srv.port,
+        '/v1/chat/completions',
+        { model: 'gpt-5.5', stream: false, messages: [{ role: 'user', content: 'hi' }] },
+        { 'X-Session-Id': 'appsrv-recover-1' },
+      );
+      assert.equal(status, 200, 'recovered after one thread/start retry');
+      assert.equal(json?.choices?.[0]?.message?.content, 'Hello from mock app-server');
+    } finally {
+      await srv.kill();
+    }
+  });
 });
 
 // ─── BACKENDS block drift guard ────────────────────────────────────────────────

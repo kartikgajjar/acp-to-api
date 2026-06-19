@@ -10,6 +10,11 @@
  *   TIMEOUT   – stall; resolve only when session/cancel arrives
  *   CRASH     – process.exit(1) when session/prompt is received
  *   USAGE     – emit text + UsageUpdate notification, resolve
+ *   NOT_FOUND_ONCE – first session/prompt → -32001 "session not found";
+ *                    subsequent prompts behave like DEFAULT (tests recovery retry)
+ *   AUTH_ERROR – session/prompt → -32000 "authentication required" (tests 401 mapping)
+ *   PARTIAL_THEN_STALL – emit one text chunk, then stall like TIMEOUT (tests
+ *                    timeout drain: handler returns the partial reply, not 504)
  */
 
 import readline from 'readline';
@@ -18,7 +23,8 @@ const SCENARIO = process.env.MOCK_SCENARIO ?? 'DEFAULT';
 
 let sessionCounter = 0;
 let currentSessionId = null;
-let pendingPromptId = null; // set in TIMEOUT scenario
+let pendingPromptId = null; // set in TIMEOUT / PARTIAL_THEN_STALL scenarios
+let promptCount = 0; // total session/prompt requests seen (for NOT_FOUND_ONCE)
 
 const rl = readline.createInterface({ input: process.stdin, terminal: false });
 
@@ -39,12 +45,29 @@ function notify(method, params) {
 }
 
 async function handlePrompt(id) {
+  promptCount++;
   if (SCENARIO === 'CRASH') {
     process.exit(1);
+  }
+  if (SCENARIO === 'AUTH_ERROR') {
+    rpcError(id, -32000, 'authentication required');
+    return;
+  }
+  if (SCENARIO === 'NOT_FOUND_ONCE' && promptCount === 1) {
+    rpcError(id, -32001, 'session sess-x not found');
+    return;
   }
   if (SCENARIO === 'TIMEOUT') {
     pendingPromptId = id;
     return; // wait for session/cancel to unblock
+  }
+  if (SCENARIO === 'PARTIAL_THEN_STALL') {
+    notify('session/update', {
+      sessionId: currentSessionId,
+      update: { type: 'AgentMessageChunk', content: { text: 'Partial reply' } },
+    });
+    pendingPromptId = id;
+    return; // stall after the partial chunk; resolve only on session/cancel
   }
   if (SCENARIO === 'SLOW') {
     await new Promise((r) => setTimeout(r, 300));

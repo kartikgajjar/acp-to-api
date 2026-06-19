@@ -20,6 +20,8 @@
  *   SLOW      – wait 300 ms, then behave like DEFAULT
  *   TIMEOUT   – stall; complete (interrupted) only when turn/interrupt arrives
  *   CRASH     – process.exit(1) when turn/start is received
+ *   NOT_FOUND_ONCE – first turn/start → -32001 "thread not found"; subsequent
+ *                    turn/start behave like DEFAULT (tests thread recovery retry)
  */
 
 import readline from 'readline';
@@ -235,6 +237,10 @@ rl.on('line', (line) => {
 
     case 'turn/start':
       seen.turnStarts++;
+      if (SCENARIO === 'NOT_FOUND_ONCE' && seen.turnStarts === 1) {
+        rpcError(id, -32001, 'thread not found');
+        break;
+      }
       seen.model = msg.params?.model ?? null;
       seen.effort = msg.params?.effort ?? null;
       seen.inputType = msg.params?.input?.[0]?.type ?? null;

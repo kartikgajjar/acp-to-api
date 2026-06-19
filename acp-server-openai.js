@@ -475,6 +475,37 @@ function apiError(res, status, message, type = 'api_error', param = null, code =
   return res.status(status).json({ error: { message, type, param, code } });
 }
 
+// Classify an ACP/JSON-RPC error into an HTTP status + OpenAI error type. Reads
+// the structured `err.acp` ({ code, message, data }) preserved by ACPSession._route,
+// falling back to message-text heuristics. Codes follow the ACP convention used by
+// acpx: -32001/-32002 = resource-not-found, -32000 = auth, -32601/-32602 = bad
+// request, -32603/-32700 = retryable internal/parse error.
+function classifyAcpError(err) {
+  const acp = err?.acp;
+  const code = acp?.code;
+  const text = `${acp?.message ?? ''} ${err?.message ?? ''}`.toLowerCase();
+  const notFound =
+    code === -32001 ||
+    code === -32002 ||
+    /session[\s\S]{0,40}not found|not found[\s\S]{0,40}session|no such session|unknown session/.test(
+      text,
+    );
+  if (notFound)
+    return { http: 404, type: 'not_found_error', retryable: false, kind: 'resource_not_found' };
+  if (code === -32000 && /auth|login|credential|token|unauthor/.test(text))
+    return { http: 401, type: 'authentication_error', retryable: false, kind: 'auth' };
+  if (code === -32601 || code === -32602)
+    return { http: 400, type: 'invalid_request_error', retryable: false, kind: 'invalid_request' };
+  if (code === -32603 || code === -32700)
+    return { http: 503, type: 'service_unavailable', retryable: true, kind: 'internal' };
+  return { http: 500, type: 'api_error', retryable: false, kind: 'unknown' };
+}
+
+// Short drain window after a prompt timeout: the agent may have already produced a
+// (partial) reply we can return instead of failing with 504 (acpx prompt-turn.ts).
+const REPLY_DRAIN_MS = 1000;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 function inferMimeType(b64) {
   const head = b64.slice(0, 8);
   if (head.startsWith('/9j/')) return 'image/jpeg';
@@ -708,8 +739,14 @@ class ACPSession extends EventEmitter {
     if (msg.id != null && this._pending.has(msg.id)) {
       const { resolve, reject } = this._pending.get(msg.id);
       this._pending.delete(msg.id);
-      if (msg.error) reject(new Error(msg.error.message ?? JSON.stringify(msg.error)));
-      else resolve(msg.result);
+      if (msg.error) {
+        // Preserve the structured JSON-RPC error so callers can classify it
+        // (HTTP status mapping, session-not-found recovery) instead of only
+        // seeing the flattened message text.
+        const e = new Error(msg.error.message ?? JSON.stringify(msg.error));
+        e.acp = { code: msg.error.code, message: msg.error.message, data: msg.error.data };
+        reject(e);
+      } else resolve(msg.result);
       return;
     }
 
@@ -774,10 +811,12 @@ class ACPSession extends EventEmitter {
   }
 
   async setModel(modelId) {
+    this._lastModel = modelId; // remembered so a recovered thread can re-apply it
     return PROFILE.setModel(this, modelId);
   }
 
   async setReasoning(effort) {
+    this._lastEffort = effort; // remembered for re-apply after thread recovery
     return PROFILE.setReasoning(this, effort);
   }
 
@@ -796,12 +835,27 @@ class ACPSession extends EventEmitter {
     this.on('chunk', handler);
     dbg(`prompt:${this.label}`, `streaming…`);
     if (timings) timings.t_prompt_sent = process.hrtime.bigint();
+    const sendPrompt = () =>
+      this._req('session/prompt', { sessionId: this.sessionId, prompt: blocks, content: blocks });
     try {
-      await this._req('session/prompt', {
-        sessionId: this.sessionId,
-        prompt: blocks,
-        content: blocks,
-      });
+      try {
+        await sendPrompt();
+      } catch (err) {
+        // Recover from an expired/not-found backend thread on a still-alive process
+        // (stateful registry path only): start a fresh thread, re-apply the desired
+        // model/effort, and retry once — but only before anything has streamed.
+        if (
+          this._recoverSession &&
+          chunks.length === 0 &&
+          classifyAcpError(err).kind === 'resource_not_found'
+        ) {
+          log(`prompt:${this.label}`, `session not found — recreating thread and retrying`);
+          await this.newSession(this.sessionCwd ?? CWD);
+          if (this._lastModel != null) await this.setModel(this._lastModel);
+          if (this._lastEffort != null) await this.setReasoning(this._lastEffort);
+          await sendPrompt();
+        } else throw err;
+      }
     } finally {
       this.off('chunk', handler);
     }
@@ -951,6 +1005,7 @@ class SessionRegistry {
     let created = false;
     if (!entry) {
       const c = makeClient(`reg-${sessionId.slice(0, 8)}`);
+      c._recoverSession = true; // stateful path: recreate the thread on not-found
       await c.start();
       await c.initialize();
       await c.newSession(cwd);
@@ -1164,7 +1219,15 @@ function chunksToOpenAIMessage(chunks) {
   return { content, tool_calls, promptTokens, completionTokens };
 }
 
-function buildChatCompletion(id, model, content, tool_calls, promptTokens, completionTokens) {
+function buildChatCompletion(
+  id,
+  model,
+  content,
+  tool_calls,
+  promptTokens,
+  completionTokens,
+  finishReason,
+) {
   return {
     id,
     object: 'chat.completion',
@@ -1178,7 +1241,7 @@ function buildChatCompletion(id, model, content, tool_calls, promptTokens, compl
           content: content || null,
           ...(tool_calls ? { tool_calls } : {}),
         },
-        finish_reason: tool_calls?.length ? 'tool_calls' : 'stop',
+        finish_reason: finishReason ?? (tool_calls?.length ? 'tool_calls' : 'stop'),
         logprobs: null,
       },
     ],
@@ -1732,11 +1795,24 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       if (!disconnected && !timedOut) recordTiming(marks, timingMeta, allChunks);
     } else {
-      const promptPromise = client.prompt(promptBlocks, undefined, marks);
-      const chunks = await Promise.race([promptPromise, timeoutPromise]);
-
-      if (timedOut) {
-        return apiError(res, 504, 'Request timed out', 'timeout', null, 'timeout');
+      const acc = [];
+      const promptPromise = client.prompt(promptBlocks, (c) => acc.push(c), marks);
+      let chunks;
+      let truncated = false;
+      try {
+        chunks = await Promise.race([promptPromise, timeoutPromise]);
+      } catch (err) {
+        if (err.message !== 'prompt_timeout' && !timedOut) throw err;
+        // Timed out: drain briefly, then return whatever the agent produced so far
+        // (finish_reason:length) rather than always failing with 504.
+        await Promise.race([promptPromise.catch(() => {}), sleep(REPLY_DRAIN_MS)]);
+        await cancelWithGrace(client, 3000);
+        const partial = chunksToOpenAIMessage(acc);
+        if (!partial.content && !partial.tool_calls?.length) {
+          return apiError(res, 504, 'Request timed out', 'timeout', null, 'timeout');
+        }
+        chunks = acc;
+        truncated = true;
       }
 
       const raw = chunksToOpenAIMessage(chunks);
@@ -1761,6 +1837,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           message.tool_calls,
           promptTokens,
           completionTokens,
+          truncated ? 'length' : undefined,
         ),
       );
     }
@@ -1778,12 +1855,18 @@ app.post('/v1/chat/completions', async (req, res) => {
         );
       }
       if (stream && res.writable && !res.writableEnded) {
+        res.write(sseData(makeDeltaChunk(id, model, {}, 'length')));
         res.write(sseDone());
         res.end();
       }
     } else {
-      log('error', err.message);
-      if (!res.headersSent) apiError(res, 500, err.message, 'api_error');
+      const c = classifyAcpError(err);
+      log('error', `${err.message}${err.acp ? ` [acp ${err.acp.code}]` : ''} → ${c.http}`);
+      if (!res.headersSent) apiError(res, c.http, err.message, c.type);
+      else if (stream && res.writable && !res.writableEnded) {
+        res.write(sseDone());
+        res.end();
+      }
     }
   } finally {
     release?.();
@@ -1981,8 +2064,21 @@ async function handleResponses(req, res) {
       await Promise.race([streamPromise, timeoutPromise]);
       if (!disconnected && !timedOut) recordTiming(marks, timingMeta, allChunks);
     } else {
-      const chunks = await Promise.race([client.prompt(blocks, undefined, marks), timeoutPromise]);
-      if (timedOut) return apiError(res, 504, 'Request timed out', 'timeout', null, 'timeout');
+      const acc = [];
+      const promptPromise = client.prompt(blocks, (c) => acc.push(c), marks);
+      let chunks;
+      try {
+        chunks = await Promise.race([promptPromise, timeoutPromise]);
+      } catch (err) {
+        if (err.message !== 'prompt_timeout' && !timedOut) throw err;
+        // Timed out: drain briefly and return any partial reply instead of 504.
+        await Promise.race([promptPromise.catch(() => {}), sleep(REPLY_DRAIN_MS)]);
+        await cancelWithGrace(client, 3000);
+        const partial = chunksToOpenAIMessage(acc);
+        if (!partial.content && !partial.tool_calls?.length)
+          return apiError(res, 504, 'Request timed out', 'timeout', null, 'timeout');
+        chunks = acc;
+      }
 
       const message = coerceToolCall(chunksToOpenAIMessage(chunks), tools);
       recordTiming(marks, timingMeta, chunks);
@@ -2004,8 +2100,10 @@ async function handleResponses(req, res) {
         );
       if (stream && res.writable && !res.writableEnded) res.end();
     } else {
-      log('error', err.message);
-      if (!res.headersSent) apiError(res, 500, err.message, 'api_error');
+      const c = classifyAcpError(err);
+      log('error', `${err.message}${err.acp ? ` [acp ${err.acp.code}]` : ''} → ${c.http}`);
+      if (!res.headersSent) apiError(res, c.http, err.message, c.type);
+      else if (stream && res.writable && !res.writableEnded) res.end();
     }
   } finally {
     release?.();

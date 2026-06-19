@@ -1054,3 +1054,87 @@ describe('ACP handshake (via successful requests)', () => {
     assert.equal(status, 200);
   });
 });
+
+// ─── Error taxonomy → HTTP status (acpx-derived) ──────────────────────────────
+
+describe('Error taxonomy → HTTP status', () => {
+  test('auth error (-32000) → 401 authentication_error', async () => {
+    const srv = await startServer({ MOCK_SCENARIO: 'AUTH_ERROR' });
+    try {
+      const { status, body } = await chat(srv.port, {
+        model: 'auto',
+        messages: [{ role: 'user', content: 'hi' }],
+      });
+      assert.equal(status, 401);
+      assert.equal(body.error.type, 'authentication_error');
+    } finally {
+      await srv.kill();
+    }
+  });
+
+  test('session not found on stateless pool path → 404 (not retried)', async () => {
+    const srv = await startServer({ MOCK_SCENARIO: 'NOT_FOUND_ONCE' });
+    try {
+      const { status, body } = await chat(srv.port, {
+        model: 'auto',
+        messages: [{ role: 'user', content: 'hi' }],
+      });
+      assert.equal(status, 404);
+      assert.equal(body.error.type, 'not_found_error');
+    } finally {
+      await srv.kill();
+    }
+  });
+});
+
+// ─── Session-not-found recovery (stateful registry path) ──────────────────────
+
+describe('Session-not-found recovery (registry path)', () => {
+  test('stateful X-Session-Id recovers via session/new + retry → 200', async () => {
+    const srv = await startServer({ MOCK_SCENARIO: 'NOT_FOUND_ONCE' });
+    try {
+      const { status, body } = await chat(
+        srv.port,
+        { model: 'auto', messages: [{ role: 'user', content: 'hi' }] },
+        { headers: { 'X-Session-Id': 'sess-recover-1' } },
+      );
+      // First prompt → -32001; proxy recreates the thread and retries once.
+      assert.equal(status, 200);
+      assert.match(body.choices[0].message.content, /Hello from mock codex/);
+    } finally {
+      await srv.kill();
+    }
+  });
+});
+
+// ─── Timeout drain/recovery ───────────────────────────────────────────────────
+
+describe('Timeout drain/recovery', () => {
+  test('partial reply before timeout → 200 with finish_reason "length"', async () => {
+    const srv = await startServer({ MOCK_SCENARIO: 'PARTIAL_THEN_STALL', MAX_EXEC_MS: '500' });
+    try {
+      const { status, body } = await chat(srv.port, {
+        model: 'auto',
+        messages: [{ role: 'user', content: 'hi' }],
+      });
+      assert.equal(status, 200);
+      assert.match(body.choices[0].message.content, /Partial reply/);
+      assert.equal(body.choices[0].finish_reason, 'length');
+    } finally {
+      await srv.kill();
+    }
+  });
+
+  test('no output before timeout → 504', async () => {
+    const srv = await startServer({ MOCK_SCENARIO: 'TIMEOUT', MAX_EXEC_MS: '500' });
+    try {
+      const { status } = await chat(srv.port, {
+        model: 'auto',
+        messages: [{ role: 'user', content: 'hi' }],
+      });
+      assert.equal(status, 504);
+    } finally {
+      await srv.kill();
+    }
+  });
+});

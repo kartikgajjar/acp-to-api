@@ -524,6 +524,31 @@ function ollamaError(res, status, message) {
   return res.status(status).json({ error: message });
 }
 
+// Classify an ACP/JSON-RPC error into an HTTP status. Reads the structured
+// `err.acp` ({ code, message, data }) preserved by ACPSession._route, falling back
+// to message-text heuristics. Codes follow the ACP convention used by acpx:
+// -32001/-32002 = resource-not-found, -32000 = auth, -32601/-32602 = bad request,
+// -32603/-32700 = retryable internal/parse error. (The Ollama surface uses a flat
+// `{ error: <string> }` envelope, so only `http`/`kind` are consumed here.)
+function classifyAcpError(err) {
+  const acp = err?.acp;
+  const code = acp?.code;
+  const text = `${acp?.message ?? ''} ${err?.message ?? ''}`.toLowerCase();
+  const notFound =
+    code === -32001 ||
+    code === -32002 ||
+    /session[\s\S]{0,40}not found|not found[\s\S]{0,40}session|no such session|unknown session/.test(
+      text,
+    );
+  if (notFound) return { http: 404, retryable: false, kind: 'resource_not_found' };
+  if (code === -32000 && /auth|login|credential|token|unauthor/.test(text))
+    return { http: 401, retryable: false, kind: 'auth' };
+  if (code === -32601 || code === -32602)
+    return { http: 400, retryable: false, kind: 'invalid_request' };
+  if (code === -32603 || code === -32700) return { http: 503, retryable: true, kind: 'internal' };
+  return { http: 500, retryable: false, kind: 'unknown' };
+}
+
 function inferMimeType(b64) {
   const head = b64.slice(0, 8);
   if (head.startsWith('/9j/')) return 'image/jpeg';
@@ -657,8 +682,14 @@ class ACPSession extends EventEmitter {
     if (msg.id != null && this._pending.has(msg.id)) {
       const { resolve, reject } = this._pending.get(msg.id);
       this._pending.delete(msg.id);
-      if (msg.error) reject(new Error(msg.error.message ?? JSON.stringify(msg.error)));
-      else resolve(msg.result);
+      if (msg.error) {
+        // Preserve the structured JSON-RPC error so callers can classify it
+        // (HTTP status mapping, session-not-found recovery) instead of only
+        // seeing the flattened message text.
+        const e = new Error(msg.error.message ?? JSON.stringify(msg.error));
+        e.acp = { code: msg.error.code, message: msg.error.message, data: msg.error.data };
+        reject(e);
+      } else resolve(msg.result);
       return;
     }
     if (msg.method === 'session/request_permission') {
@@ -720,10 +751,12 @@ class ACPSession extends EventEmitter {
   }
 
   async setModel(modelId) {
+    this._lastModel = modelId; // remembered so a recovered thread can re-apply it
     return PROFILE.setModel(this, modelId);
   }
 
   async setReasoning(effort) {
+    this._lastEffort = effort; // remembered for re-apply after thread recovery
     return PROFILE.setReasoning(this, effort);
   }
 
@@ -744,12 +777,27 @@ class ACPSession extends EventEmitter {
     this.on('chunk', handler);
     dbg(`prompt:${this.label}`, `streaming…`);
     if (timings) timings.t_prompt_sent = process.hrtime.bigint();
+    const sendPrompt = () =>
+      this._req('session/prompt', { sessionId: this.sessionId, prompt: blocks, content: blocks });
     try {
-      await this._req('session/prompt', {
-        sessionId: this.sessionId,
-        prompt: blocks,
-        content: blocks,
-      });
+      try {
+        await sendPrompt();
+      } catch (err) {
+        // Recover from an expired/not-found backend thread on a still-alive process
+        // (stateful registry path only): start a fresh thread, re-apply the desired
+        // model/effort, and retry once — but only before anything has streamed.
+        if (
+          this._recoverSession &&
+          chunks.length === 0 &&
+          classifyAcpError(err).kind === 'resource_not_found'
+        ) {
+          log(`prompt:${this.label}`, `session not found — recreating thread and retrying`);
+          await this.newSession(this.sessionCwd ?? CWD);
+          if (this._lastModel != null) await this.setModel(this._lastModel);
+          if (this._lastEffort != null) await this.setReasoning(this._lastEffort);
+          await sendPrompt();
+        } else throw err;
+      }
     } finally {
       this.off('chunk', handler);
     }
@@ -887,6 +935,7 @@ class SessionRegistry {
     let created = false;
     if (!entry) {
       const c = makeClient(`reg-${sessionId.slice(0, 8)}`);
+      c._recoverSession = true; // stateful path: recreate the thread on not-found
       await c.start();
       await c.initialize();
       await c.newSession(cwd);
@@ -1689,8 +1738,9 @@ async function handleOllamaCompletion(
       }
     }
   } catch (err) {
-    log('error', err.message);
-    if (!res.headersSent) ollamaError(res, 500, err.message);
+    const c = classifyAcpError(err);
+    log('error', `${err.message}${err.acp ? ` [acp ${err.acp.code}]` : ''} → ${c.http}`);
+    if (!res.headersSent) ollamaError(res, c.http, err.message);
   } finally {
     if (slot) pool.release(slot);
   }

@@ -235,9 +235,28 @@ export class AppServerSession extends EventEmitter {
     if (msg.id != null && this._pending.has(msg.id)) {
       const { resolve, reject } = this._pending.get(msg.id);
       this._pending.delete(msg.id);
-      if (msg.error) reject(new Error(msg.error.message ?? JSON.stringify(msg.error)));
-      else resolve(msg.result);
+      if (msg.error) {
+        // Preserve the structured error so callers (HTTP status mapping in the
+        // interface file) and our own thread-not-found recovery can classify it.
+        const e = new Error(msg.error.message ?? JSON.stringify(msg.error));
+        e.acp = { code: msg.error.code, message: msg.error.message, data: msg.error.data };
+        reject(e);
+      } else resolve(msg.result);
     }
+  }
+
+  // Detect an expired/unknown thread so prompt() can recreate it and retry once.
+  // app-server surfaces this at turn/start; codes mirror the ACP convention.
+  _isSessionNotFound(err) {
+    const code = err?.acp?.code;
+    const text = `${err?.acp?.message ?? ''} ${err?.message ?? ''}`.toLowerCase();
+    return (
+      code === -32001 ||
+      code === -32002 ||
+      /thread[\s\S]{0,40}not found|not found[\s\S]{0,40}thread|no such thread|unknown thread|session[\s\S]{0,40}not found/.test(
+        text,
+      )
+    );
   }
 
   // Auto-approve server-initiated approval requests (full-access proxy). With the
@@ -381,7 +400,7 @@ export class AppServerSession extends EventEmitter {
     };
     this.on('chunk', handler);
     if (timings) timings.t_prompt_sent = process.hrtime.bigint();
-    try {
+    const runTurn = async () => {
       const params = {
         threadId: this.sessionId,
         input: this._buildInput(blocks),
@@ -399,6 +418,21 @@ export class AppServerSession extends EventEmitter {
         if (status === 'failed') throw new Error('turn failed');
       } else {
         await new Promise((resolve, reject) => this._turns.set(turnId, { resolve, reject }));
+      }
+    };
+    try {
+      try {
+        await runTurn();
+      } catch (err) {
+        // Recover from an expired/not-found thread on a still-alive process
+        // (stateful registry path only): start a fresh thread and retry once —
+        // but only before anything has streamed. _pendingModel/_pendingEffort
+        // persist on the session, so the retried turn keeps the same overrides.
+        if (this._recoverSession && chunks.length === 0 && this._isSessionNotFound(err)) {
+          this._log(`prompt:${this.label}`, `thread not found — recreating and retrying`);
+          await this.newSession(this.sessionCwd ?? this._cwd);
+          await runTurn();
+        } else throw err;
       }
     } finally {
       this.off('chunk', handler);
